@@ -205,7 +205,7 @@ fn decode_svg(bytes: &[u8]) -> Result<DecodedImage, ImageAssetError> {
 }
 
 fn unpremultiply_rgba(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         let alpha = u32::from(pixel[3]);
         if alpha == 0 {
             pixel[..3].fill(0);

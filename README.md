@@ -34,7 +34,7 @@ Defaults follow the usual rule: a 20-second reminder every 20 minutes, 55% opaci
 
 Requirements:
 
-- Rust `1.95.0` (pinned by `rust-toolchain.toml`).
+- Rust `1.98.0` (pinned by `rust-toolchain.toml`).
 - Visual Studio 2022 Build Tools or Visual Studio with the Desktop development with C++ workload.
 
 On Windows, `build-local.bat` initializes the x64 MSVC environment automatically:
