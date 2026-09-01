@@ -1,0 +1,67 @@
+[package]
+name = "ohmyeyes"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A configurable 20-20-20 eye-break reminder"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/PD758/OhMyEyes"
+publish = false
+exclude = ["/dist", "/target"]
+
+[dependencies]
+directories = "6.0"
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
+image = { version = "0.25.8", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+resvg = { version = "0.48.1", default-features = false }
+rfd = "0.17.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.23"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+auto-launch = "0.6.0"
+interprocess = "2.4.3"
+single-instance = "0.3.3"
+tray-icon = "0.24.2"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+strip = "symbols"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+
+[package.metadata.packager]
+product-name = "OhMyEyes"
+identifier = "app.ohmyeyes.desktop"
+description = "A configurable 20-20-20 eye-break reminder"
+long-description = "OhMyEyes shows a configurable click-through eye overlay to remind you to take regular screen breaks."
+category = "Utility"
+license-file = "LICENSE"
+icons = ["assets/default-eye.png"]
+formats = ["nsis"]
+before-packaging-command = "cargo build --release --locked"
+
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"

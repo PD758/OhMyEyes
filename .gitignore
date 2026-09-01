@@ -1,0 +1,17 @@
+/target/
+/dist/
+
+*.log
+*.tmp
+*.profraw
+lcov.info
+/coverage/
+
+.env
+.env.*
+!.env.example
+
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
