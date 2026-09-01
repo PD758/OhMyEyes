@@ -284,6 +284,80 @@ mod tests {
     }
 
     #[test]
+    fn absolute_image_paths_are_preserved() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let image_path = directory.path().join("eye.png");
+        let settings = Settings {
+            image_path: Some(image_path.clone()),
+            ..Settings::default()
+        };
+
+        assert_eq!(
+            settings.resolve_image_path(Path::new("unused")),
+            Some(image_path)
+        );
+    }
+
+    #[test]
+    fn missing_configuration_returns_defaults() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("missing.json"));
+
+        let loaded = store.load().expect("missing configuration should load");
+
+        assert_eq!(loaded.settings, Settings::default());
+        assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn partial_configuration_uses_defaults_and_reports_normalization() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("config.json");
+        fs::write(&path, r#"{"interval_minutes":0}"#).expect("partial configuration should save");
+
+        let loaded = ConfigStore::new(path)
+            .load()
+            .expect("partial configuration should load");
+
+        assert_eq!(loaded.settings.interval_minutes, 1);
+        assert_eq!(loaded.settings.duration_seconds, 20);
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(loaded.warnings[0].contains("interval_minutes"));
+    }
+
+    #[test]
+    fn newer_configuration_schema_is_rejected() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("config.json");
+        let schema = u64::from(CONFIG_SCHEMA_VERSION) + 1;
+        fs::write(&path, format!(r#"{{"schema_version":{schema}}}"#))
+            .expect("future configuration should save");
+
+        let error = ConfigStore::new(path)
+            .load()
+            .expect_err("future schema should be rejected");
+
+        assert!(matches!(
+            error,
+            ConfigError::UnsupportedSchema { found, supported }
+                if found == schema && supported == CONFIG_SCHEMA_VERSION
+        ));
+    }
+
+    #[test]
+    fn malformed_configuration_is_reported() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("config.json");
+        fs::write(&path, b"{not-json").expect("invalid configuration should save");
+
+        let error = ConfigStore::new(path)
+            .load()
+            .expect_err("invalid JSON should be rejected");
+
+        assert!(matches!(error, ConfigError::Json(_)));
+    }
+
+    #[test]
     fn configuration_round_trips_atomically() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let store = ConfigStore::new(directory.path().join("config.json"));
@@ -304,6 +378,26 @@ mod tests {
             .expect("existing settings should be replaced");
         let loaded = store.load().expect("replacement settings should load");
         assert_eq!(loaded.settings, replacement);
+    }
+
+    #[test]
+    fn saving_normalizes_a_copy_without_mutating_the_caller() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let settings = Settings {
+            interval_minutes: 0,
+            opacity_percent: 1,
+            ..Settings::default()
+        };
+
+        store.save(&settings).expect("settings should save");
+        let loaded = store.load().expect("saved settings should load");
+
+        assert_eq!(settings.interval_minutes, 0);
+        assert_eq!(settings.opacity_percent, 1);
+        assert_eq!(loaded.settings.interval_minutes, 1);
+        assert_eq!(loaded.settings.opacity_percent, 5);
+        assert!(loaded.warnings.is_empty());
     }
 
     #[test]

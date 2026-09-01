@@ -102,7 +102,7 @@ function Get-WindowRect([IntPtr]$Window) {
 
 $primary = $null
 try {
-    $primary = Start-Process -FilePath $binaryPath -PassThru
+    $primary = Start-Process -FilePath $binaryPath -ArgumentList "--show-now" -PassThru
     Start-Sleep -Seconds 4
     $primary.Refresh()
     if ($primary.HasExited) {
@@ -128,15 +128,34 @@ try {
         throw "Show-now activation failed with code $($activation.ExitCode)."
     }
     Start-Sleep -Seconds 3
-    $overlayWindow = [OhMyEyesWindowTest]::FindWindow($primary.Id, "OhMyEyes reminder")
-    if ($overlayWindow -eq [IntPtr]::Zero) {
-        throw "The reminder overlay HWND was not found."
+    $overlayWindow = [IntPtr]::Zero
+    $overlayRect = $null
+    $overlayDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $overlayWindow = [OhMyEyesWindowTest]::FindWindow($primary.Id, "OhMyEyes reminder")
+        if ($overlayWindow -ne [IntPtr]::Zero) {
+            $overlayRect = Get-WindowRect $overlayWindow
+        }
+        if (-not $overlayRect -or
+            $overlayRect.Right -le $overlayRect.Left -or
+            $overlayRect.Bottom -le $overlayRect.Top) {
+            Start-Sleep -Milliseconds 100
+        }
+    } while (
+        (-not $overlayRect -or
+            $overlayRect.Right -le $overlayRect.Left -or
+            $overlayRect.Bottom -le $overlayRect.Top) -and
+        [DateTime]::UtcNow -lt $overlayDeadline
+    )
+    if (-not $overlayRect -or
+        $overlayRect.Right -le $overlayRect.Left -or
+        $overlayRect.Bottom -le $overlayRect.Top) {
+        throw "The reminder overlay did not obtain non-empty bounds within ten seconds."
     }
     $overlayStyle = [OhMyEyesWindowTest]::GetWindowLongPtr($overlayWindow, -20).ToInt64()
     if (($overlayStyle -band $transparentStyle) -eq 0) {
         throw "The reminder overlay does not have WS_EX_TRANSPARENT."
     }
-    $overlayRect = Get-WindowRect $overlayWindow
     Write-Output "Overlay bounds: $($overlayRect.Left),$($overlayRect.Top) - $($overlayRect.Right),$($overlayRect.Bottom)"
     $capturePath = Join-Path $captureDirectory "overlay-crop.png"
     Save-WindowCenterCrop $overlayRect $capturePath

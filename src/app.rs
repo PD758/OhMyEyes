@@ -66,7 +66,7 @@ pub struct OhMyEyesApp {
 }
 
 impl OhMyEyesApp {
-    pub fn new(cc: &CreationContext<'_>, background: bool) -> Self {
+    pub fn new(cc: &CreationContext<'_>, background: bool, show_now: bool) -> Self {
         configure_style(&cc.egui_ctx);
         let config_store = ConfigStore::for_current_user()
             .unwrap_or_else(|_| ConfigStore::new(PathBuf::from("OhMyEyes-config.json")));
@@ -205,6 +205,10 @@ impl OhMyEyesApp {
             overlay,
         };
         app.refresh_tray(&cc.egui_ctx);
+        if show_now {
+            let action = app.scheduler.show_now(app.now());
+            app.apply_scheduler_action(&cc.egui_ctx, action);
+        }
         app
     }
 
@@ -744,6 +748,17 @@ impl eframe::App for OhMyEyesApp {
         while let Ok(command) = self.commands_rx.try_recv() {
             self.process_command(ctx, command);
         }
+        #[cfg(windows)]
+        if let Some(error) = self
+            .overlay
+            .as_ref()
+            .and_then(crate::windows::OverlayController::take_error)
+        {
+            append_status(
+                &mut self.status,
+                format!("Could not render reminder overlay: {error}"),
+            );
+        }
         let action = self.scheduler.tick(self.now());
         self.apply_scheduler_action(ctx, action);
         let next_animation_frame = self.update_animation(ctx);
@@ -935,4 +950,30 @@ fn paint_eye(
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::from_white_alpha((u16::from(opacity_percent) * 255 / 100) as u8),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_messages_are_appended_without_losing_context() {
+        let mut status = None;
+
+        append_status(&mut status, "first".to_owned());
+        append_status(&mut status, "second".to_owned());
+
+        assert_eq!(status.as_deref(), Some("first; second"));
+    }
+
+    #[test]
+    fn system_pause_reasons_use_independent_mask_bits() {
+        let power = pause_reason_mask(SystemPauseReason::Power);
+        let session = pause_reason_mask(SystemPauseReason::Session);
+
+        assert_ne!(power, 0);
+        assert_ne!(session, 0);
+        assert_eq!(power & session, 0);
+        assert_eq!((power | session) & !power, session);
+    }
 }

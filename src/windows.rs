@@ -24,18 +24,19 @@ use windows_sys::Win32::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
         SelectObject,
     },
+    System::LibraryLoader::GetModuleHandleW,
     System::RemoteDesktop::{
         NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
     },
     UI::WindowsAndMessaging::{
-        CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
-        GetMessageW, GetWindowLongPtrW, HTTRANSPARENT, MONITORINFOF_PRIMARY, MSG,
+        CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HTTRANSPARENT, MONITORINFOF_PRIMARY, MSG,
         PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, RegisterClassW, SW_HIDE,
         SW_SHOWNOACTIVATE, SetWindowLongPtrW, ShowWindow, TranslateMessage, ULW_ALPHA,
-        UpdateLayeredWindow, WM_APP, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_NCCREATE, WM_NCHITTEST,
-        WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK,
-        WTS_SESSION_UNLOCK,
+        UnregisterClassW, UpdateLayeredWindow, WM_APP, WM_DISPLAYCHANGE, WM_ERASEBKGND,
+        WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE,
+        WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
     },
 };
 
@@ -45,6 +46,7 @@ const IPC_NAME: &str = "app.ohmyeyes.desktop.ipc";
 const IPC_COMMAND_LIMIT: u64 = 64;
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const OVERLAY_UPDATE_MESSAGE: u32 = WM_APP + 20;
+const MAX_OVERLAY_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct NativeDisplay {
@@ -105,15 +107,9 @@ unsafe extern "system" fn collect_display(
     }
 
     let rect = info.monitorInfo.rcMonitor;
-    let Ok(width) = u32::try_from(rect.right - rect.left) else {
+    let Some((width, height)) = display_dimensions(&rect) else {
         return 1;
     };
-    let Ok(height) = u32::try_from(rect.bottom - rect.top) else {
-        return 1;
-    };
-    if width == 0 || height == 0 {
-        return 1;
-    }
 
     let name_length = info
         .szDevice
@@ -145,9 +141,24 @@ unsafe extern "system" fn collect_display(
         },
         primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
     };
-    let displays = data as *mut Vec<EnumeratedDisplay>;
-    unsafe { (*displays).push(entry) };
+    // EnumDisplayMonitors invokes the callback synchronously while this vector is alive.
+    let Some(displays) = (unsafe { (data as *mut Vec<EnumeratedDisplay>).as_mut() }) else {
+        return 0;
+    };
+    displays.push(entry);
     1
+}
+
+fn display_dimensions(rect: &RECT) -> Option<(u32, u32)> {
+    let width = rect
+        .right
+        .checked_sub(rect.left)
+        .and_then(|value| u32::try_from(value).ok().filter(|dimension| *dimension > 0))?;
+    let height = rect
+        .bottom
+        .checked_sub(rect.top)
+        .and_then(|value| u32::try_from(value).ok().filter(|dimension| *dimension > 0))?;
+    Some((width, height))
 }
 
 const OVERLAY_CLASS_NAME: &[u16] = &[
@@ -209,6 +220,7 @@ enum OverlayCommand {
 
 pub struct OverlayController {
     pending: Arc<Mutex<Option<OverlayCommand>>>,
+    last_error: Arc<Mutex<Option<String>>>,
     window: isize,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -217,14 +229,19 @@ impl OverlayController {
     pub fn create() -> Result<Self, String> {
         let pending = Arc::new(Mutex::new(None));
         let worker_pending = Arc::clone(&pending);
+        let last_error = Arc::new(Mutex::new(None));
+        let worker_last_error = Arc::clone(&last_error);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("ohmyeyes-overlay".to_owned())
-            .spawn(move || unsafe { overlay_message_loop(worker_pending, ready_sender) })
+            .spawn(move || unsafe {
+                overlay_message_loop(worker_pending, worker_last_error, ready_sender)
+            })
             .map_err(|error| error.to_string())?;
         let window = ready_receiver.recv().map_err(|error| error.to_string())??;
         Ok(Self {
             pending,
+            last_error,
             window,
             thread: Some(thread),
         })
@@ -260,12 +277,22 @@ impl OverlayController {
         self.queue(OverlayCommand::Hide)
     }
 
+    pub fn take_error(&self) -> Option<String> {
+        self.last_error.lock().ok()?.take()
+    }
+
     fn queue(&self, command: OverlayCommand) -> Result<(), String> {
-        *self
+        let mut pending = self
             .pending
             .lock()
-            .map_err(|_| "overlay command lock is poisoned".to_owned())? = Some(command);
-        self.wake()
+            .map_err(|_| "overlay command lock is poisoned".to_owned())?;
+        let wake_required = pending.is_none();
+        *pending = Some(command);
+        if wake_required && let Err(error) = self.wake() {
+            *pending = None;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn wake(&self) -> Result<(), String> {
@@ -289,10 +316,17 @@ impl Drop for OverlayController {
 
 unsafe fn overlay_message_loop(
     pending: Arc<Mutex<Option<OverlayCommand>>>,
+    last_error: Arc<Mutex<Option<String>>>,
     ready_sender: mpsc::SyncSender<Result<isize, String>>,
 ) {
+    let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+    if instance.is_null() {
+        let _ = ready_sender.send(Err(io::Error::last_os_error().to_string()));
+        return;
+    }
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(overlay_window_proc),
+        hInstance: instance,
         lpszClassName: OVERLAY_CLASS_NAME.as_ptr(),
         ..unsafe { std::mem::zeroed() }
     };
@@ -312,22 +346,32 @@ unsafe fn overlay_message_loop(
             0,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            instance,
             std::ptr::null(),
         )
     };
     if window.is_null() {
         let _ = ready_sender.send(Err(io::Error::last_os_error().to_string()));
+        unsafe { UnregisterClassW(OVERLAY_CLASS_NAME.as_ptr(), instance) };
         return;
     }
     if ready_sender.send(Ok(window as isize)).is_err() {
+        unsafe {
+            DestroyWindow(window);
+            UnregisterClassW(OVERLAY_CLASS_NAME.as_ptr(), instance);
+        }
         return;
     }
 
     let mut message: MSG = unsafe { std::mem::zeroed() };
     loop {
         let result = unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) };
-        if result <= 0 {
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            tracing::error!(%error, "native overlay message loop failed");
+            break;
+        }
+        if result == 0 {
             break;
         }
         if message.message == OVERLAY_UPDATE_MESSAGE {
@@ -337,6 +381,9 @@ unsafe fn overlay_message_loop(
                 match command {
                     OverlayCommand::Show(frame) => {
                         if let Err(error) = unsafe { update_layered_overlay(window, &frame) } {
+                            if let Ok(mut last_error) = last_error.lock() {
+                                *last_error = Some(error.clone());
+                            }
                             tracing::error!(%error, "native overlay could not be rendered");
                         }
                     }
@@ -356,10 +403,20 @@ unsafe fn overlay_message_loop(
             }
         }
     }
-    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(window) };
+    unsafe {
+        DestroyWindow(window);
+        UnregisterClassW(OVERLAY_CLASS_NAME.as_ptr(), instance);
+    }
 }
 
-unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(), String> {
+#[derive(Debug)]
+struct OverlaySurface {
+    width: i32,
+    height: i32,
+    pixels: Vec<u8>,
+}
+
+fn render_overlay_surface(frame: &OverlayFrame) -> Result<OverlaySurface, String> {
     if frame.width == 0 || frame.height == 0 || frame.image_size.contains(&0) {
         return Err("overlay or image dimensions are empty".to_owned());
     }
@@ -369,6 +426,10 @@ unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(
     if frame.image_rgba.len() != expected_length {
         return Err("image pixel buffer has an invalid length".to_owned());
     }
+    let overlay_width = i32::try_from(frame.width).map_err(|_| "overlay is too wide".to_owned())?;
+    let overlay_height =
+        i32::try_from(frame.height).map_err(|_| "overlay is too tall".to_owned())?;
+    let canvas_length = overlay_canvas_length(frame.width, frame.height)?;
 
     let (target_width, target_height) = scaled_overlay_size(frame);
     let source = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
@@ -383,14 +444,16 @@ unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(
         target_height,
         image::imageops::FilterType::Lanczos3,
     );
-    let canvas_length = usize::try_from(u64::from(frame.width) * u64::from(frame.height) * 4)
-        .map_err(|_| "overlay dimensions are too large".to_owned())?;
-    let mut canvas = vec![0_u8; canvas_length];
+    let mut canvas = Vec::new();
+    canvas
+        .try_reserve_exact(canvas_length)
+        .map_err(|_| "could not allocate the overlay pixel buffer".to_owned())?;
+    canvas.resize(canvas_length, 0_u8);
     let center_x = (frame.position[0].clamp(0.0, 1.0) * frame.width as f32).round() as i64;
     let center_y = (frame.position[1].clamp(0.0, 1.0) * frame.height as f32).round() as i64;
     let origin_x = center_x - i64::from(target_width) / 2;
     let origin_y = center_y - i64::from(target_height) / 2;
-    let opacity = u32::from(frame.opacity_percent) * 255 / 100;
+    let opacity = u32::from(frame.opacity_percent.min(100)) * 255 / 100;
 
     for source_y in 0..target_height {
         let destination_y = origin_y + i64::from(source_y);
@@ -404,21 +467,32 @@ unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(
             }
             let pixel = scaled.get_pixel(source_x, source_y).0;
             let alpha = u32::from(pixel[3]) * opacity / 255;
-            let destination = (u64::try_from(destination_y).unwrap_or(0) * u64::from(frame.width)
-                + u64::try_from(destination_x).unwrap_or(0))
-                * 4;
+            let destination_y = u64::try_from(destination_y)
+                .map_err(|_| "overlay pixel row is outside the canvas".to_owned())?;
+            let destination_x = u64::try_from(destination_x)
+                .map_err(|_| "overlay pixel column is outside the canvas".to_owned())?;
+            let destination = (destination_y * u64::from(frame.width) + destination_x) * 4;
             let destination = usize::try_from(destination)
                 .map_err(|_| "overlay pixel offset is too large".to_owned())?;
-            canvas[destination] = (u32::from(pixel[2]) * alpha / 255) as u8;
-            canvas[destination + 1] = (u32::from(pixel[1]) * alpha / 255) as u8;
-            canvas[destination + 2] = (u32::from(pixel[0]) * alpha / 255) as u8;
-            canvas[destination + 3] = alpha as u8;
+            let output = canvas
+                .get_mut(destination..destination + 4)
+                .ok_or_else(|| "overlay pixel offset is outside the canvas".to_owned())?;
+            output[0] = (u32::from(pixel[2]) * alpha / 255) as u8;
+            output[1] = (u32::from(pixel[1]) * alpha / 255) as u8;
+            output[2] = (u32::from(pixel[0]) * alpha / 255) as u8;
+            output[3] = alpha as u8;
         }
     }
 
-    let overlay_width = i32::try_from(frame.width).map_err(|_| "overlay is too wide".to_owned())?;
-    let overlay_height =
-        i32::try_from(frame.height).map_err(|_| "overlay is too tall".to_owned())?;
+    Ok(OverlaySurface {
+        width: overlay_width,
+        height: overlay_height,
+        pixels: canvas,
+    })
+}
+
+unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(), String> {
+    let surface = render_overlay_surface(frame)?;
     let screen_dc = std::ptr::null_mut();
     let memory_dc = unsafe { CreateCompatibleDC(screen_dc) };
     if memory_dc.is_null() {
@@ -427,8 +501,8 @@ unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(
     let mut bitmap_info: BITMAPINFO = unsafe { std::mem::zeroed() };
     bitmap_info.bmiHeader = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: overlay_width,
-        biHeight: -overlay_height,
+        biWidth: surface.width,
+        biHeight: -surface.height,
         biPlanes: 1,
         biBitCount: 32,
         biCompression: BI_RGB,
@@ -446,25 +520,35 @@ unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(
         )
     };
     if bitmap.is_null() || bits.is_null() {
-        unsafe { DeleteDC(memory_dc) };
-        return Err(io::Error::last_os_error().to_string());
+        let error = io::Error::last_os_error().to_string();
+        unsafe {
+            if !bitmap.is_null() {
+                DeleteObject(bitmap);
+            }
+            DeleteDC(memory_dc);
+        }
+        return Err(error);
     }
-    unsafe { std::ptr::copy_nonoverlapping(canvas.as_ptr(), bits.cast(), canvas.len()) };
+    // A 32-bpp DIB has one four-byte pixel per canvas pixel, with no row padding.
+    unsafe {
+        std::ptr::copy_nonoverlapping(surface.pixels.as_ptr(), bits.cast(), surface.pixels.len())
+    };
     let previous = unsafe { SelectObject(memory_dc, bitmap) };
     if previous.is_null() {
+        let error = io::Error::last_os_error().to_string();
         unsafe {
             DeleteObject(bitmap);
             DeleteDC(memory_dc);
         }
-        return Err(io::Error::last_os_error().to_string());
+        return Err(error);
     }
     let destination = windows_sys::Win32::Foundation::POINT {
         x: frame.left,
         y: frame.top,
     };
     let size = windows_sys::Win32::Foundation::SIZE {
-        cx: overlay_width,
-        cy: overlay_height,
+        cx: surface.width,
+        cy: surface.height,
     };
     let source_point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
@@ -486,20 +570,30 @@ unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(
             ULW_ALPHA,
         )
     };
+    let update_error = (updated == 0).then(|| io::Error::last_os_error().to_string());
+    let restored = unsafe { SelectObject(memory_dc, previous) };
+    if restored.is_null() {
+        unsafe {
+            DeleteDC(memory_dc);
+            DeleteObject(bitmap);
+        }
+        return Err("could not restore the previous GDI bitmap".to_owned());
+    }
     unsafe {
-        SelectObject(memory_dc, previous);
         DeleteObject(bitmap);
         DeleteDC(memory_dc);
     }
-    if updated == 0 {
-        return Err(io::Error::last_os_error().to_string());
+    if let Some(error) = update_error {
+        return Err(error);
     }
     unsafe { ShowWindow(window, SW_SHOWNOACTIVATE) };
     Ok(())
 }
 
 fn scaled_overlay_size(frame: &OverlayFrame) -> (u32, u32) {
-    let requested_width = (frame.width * u32::from(frame.width_percent) / 100).max(1);
+    let requested_width = (u64::from(frame.width) * u64::from(frame.width_percent) / 100)
+        .max(1)
+        .min(u64::from(frame.width.max(1))) as u32;
     let requested_height = ((u64::from(requested_width) * u64::from(frame.image_size[1]))
         / u64::from(frame.image_size[0]))
     .max(1);
@@ -511,6 +605,14 @@ fn scaled_overlay_size(frame: &OverlayFrame) -> (u32, u32) {
     .max(1)
     .min(u64::from(frame.width)) as u32;
     (width, frame.height)
+}
+
+fn overlay_canvas_length(width: u32, height: u32) -> Result<usize, String> {
+    let bytes = u64::from(width) * u64::from(height) * 4;
+    if bytes > MAX_OVERLAY_BYTES {
+        return Err("overlay pixel buffer exceeds 256 MiB".to_owned());
+    }
+    usize::try_from(bytes).map_err(|_| "overlay dimensions are too large".to_owned())
 }
 
 unsafe extern "system" fn overlay_window_proc(
@@ -618,13 +720,21 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
         b's' as u16,
         0,
     ];
+    let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+    if instance.is_null() {
+        let error = io::Error::last_os_error();
+        tracing::warn!(%error, "current Windows module handle is unavailable");
+        return;
+    }
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(system_event_window_proc),
+        hInstance: instance,
         lpszClassName: CLASS_NAME.as_ptr(),
         ..unsafe { std::mem::zeroed() }
     };
     if unsafe { RegisterClassW(&raw const window_class) } == 0 {
-        tracing::warn!("system event window class could not be registered");
+        let error = io::Error::last_os_error();
+        tracing::warn!(%error, "system event window class could not be registered");
         return;
     }
 
@@ -642,28 +752,46 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
             0,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            instance,
             state_pointer.cast(),
         )
     };
     if window.is_null() {
+        let error = io::Error::last_os_error();
         drop(unsafe { Box::from_raw(state_pointer) });
-        tracing::warn!("system event window could not be created");
+        unsafe { UnregisterClassW(CLASS_NAME.as_ptr(), instance) };
+        tracing::warn!(%error, "system event window could not be created");
         return;
     }
 
-    if unsafe { WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) } == 0 {
-        tracing::warn!("Windows session notifications could not be registered");
+    let session_notifications_registered =
+        unsafe { WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) } != 0;
+    if !session_notifications_registered {
+        let error = io::Error::last_os_error();
+        tracing::warn!(%error, "Windows session notifications could not be registered");
     }
     let mut message: MSG = unsafe { std::mem::zeroed() };
-    while unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) } > 0 {
+    loop {
+        let result = unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            tracing::error!(%error, "system event message loop failed");
+            break;
+        }
+        if result == 0 {
+            break;
+        }
         unsafe {
             TranslateMessage(&raw const message);
             DispatchMessageW(&raw const message);
         }
     }
     unsafe {
-        WTSUnRegisterSessionNotification(window);
+        if session_notifications_registered {
+            WTSUnRegisterSessionNotification(window);
+        }
+        DestroyWindow(window);
+        UnregisterClassW(CLASS_NAME.as_ptr(), instance);
         drop(Box::from_raw(state_pointer));
     }
 }
@@ -704,6 +832,9 @@ unsafe extern "system" fn system_event_window_proc(
             let _ = state.sender.send(command);
             state.context.request_repaint();
         }
+    }
+    if message == WM_NCDESTROY {
+        unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, 0) };
     }
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
@@ -830,6 +961,136 @@ mod tests {
         let frame = overlay_frame([400, 200]);
 
         assert_eq!(scaled_overlay_size(&frame), (480, 240));
+    }
+
+    #[test]
+    fn wide_overlay_image_keeps_at_least_one_pixel_of_height() {
+        let frame = overlay_frame([4_096, 1]);
+
+        assert_eq!(scaled_overlay_size(&frame), (480, 1));
+    }
+
+    #[test]
+    fn zero_width_percentage_is_defensive_even_before_settings_normalization() {
+        let mut frame = overlay_frame([400, 200]);
+        frame.width_percent = 0;
+
+        assert_eq!(scaled_overlay_size(&frame), (1, 1));
+    }
+
+    #[test]
+    fn matching_aspect_ratio_can_fill_the_monitor() {
+        let mut frame = overlay_frame([1_920, 1_080]);
+        frame.width_percent = 100;
+
+        assert_eq!(scaled_overlay_size(&frame), (1_920, 1_080));
+    }
+
+    #[test]
+    fn excessive_width_percentage_and_large_monitor_do_not_overflow() {
+        let mut frame = overlay_frame([1, 1]);
+        frame.width = u32::MAX;
+        frame.width_percent = u8::MAX;
+
+        let (width, height) = scaled_overlay_size(&frame);
+
+        assert_eq!(width, frame.height);
+        assert_eq!(height, frame.height);
+    }
+
+    #[test]
+    fn display_dimensions_support_negative_origins_and_reject_overflow() {
+        let secondary = RECT {
+            left: -1_920,
+            top: -1_080,
+            right: 0,
+            bottom: 0,
+        };
+        let overflowing = RECT {
+            left: i32::MIN,
+            top: 0,
+            right: i32::MAX,
+            bottom: 1,
+        };
+
+        assert_eq!(display_dimensions(&secondary), Some((1_920, 1_080)));
+        assert_eq!(display_dimensions(&overflowing), None);
+        assert_eq!(
+            display_dimensions(&RECT {
+                left: 10,
+                top: 0,
+                right: 10,
+                bottom: 1,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn overlay_canvas_allocation_is_bounded() {
+        assert_eq!(overlay_canvas_length(1_920, 1_080), Ok(8_294_400));
+        assert!(overlay_canvas_length(16_384, 16_384).is_err());
+    }
+
+    #[test]
+    fn rendered_surface_is_premultiplied_bgra() {
+        let mut frame = overlay_frame([1, 1]);
+        frame.width = 2;
+        frame.height = 2;
+        frame.width_percent = 50;
+        frame.opacity_percent = u8::MAX;
+        frame.image_rgba = Arc::from([100, 50, 25, 128]);
+
+        let surface = render_overlay_surface(&frame).expect("surface should render");
+
+        assert_eq!((surface.width, surface.height), (2, 2));
+        assert_eq!(&surface.pixels[..12], &[0; 12]);
+        assert_eq!(&surface.pixels[12..], &[12, 25, 50, 128]);
+    }
+
+    #[test]
+    fn rendered_surface_rejects_invalid_pixel_buffer() {
+        let frame = overlay_frame([1, 1]);
+
+        let error = render_overlay_surface(&frame).expect_err("empty pixels should be rejected");
+
+        assert_eq!(error, "image pixel buffer has an invalid length");
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn native_layered_overlay_updates_window_bounds() {
+        let overlay = OverlayController::create().expect("overlay window should be created");
+        let pixel = Arc::from([255, 255, 255, 255]);
+        overlay
+            .show(10, 20, 320, 200, &pixel, [1, 1], 25, 55, [0.5, 0.5])
+            .expect("overlay update should be queued");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(error) = overlay.take_error() {
+                panic!("overlay worker failed: {error}");
+            }
+            let mut rect = RECT::default();
+            let succeeded = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(
+                    overlay.window as HWND,
+                    &raw mut rect,
+                )
+            };
+            if succeeded != 0 && rect.right > rect.left && rect.bottom > rect.top {
+                assert_eq!(rect.right - rect.left, 320);
+                assert_eq!(rect.bottom - rect.top, 200);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "overlay window remained empty after three seconds"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        overlay.hide().expect("overlay should hide");
     }
 
     fn overlay_frame(image_size: [u32; 2]) -> OverlayFrame {

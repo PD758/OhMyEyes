@@ -26,4 +26,13 @@ Windows UI smoke tests require an interactive desktop session and no other runni
 .\scripts\smoke-test-overlay.ps1
 ```
 
+Core logic coverage is enforced at 90%. The eframe lifecycle and Win32 integration are excluded
+from this metric and covered by the interactive smoke tests instead:
+
+```powershell
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked --version 0.9.0
+cargo llvm-cov --locked --all-targets --all-features --ignore-filename-regex '(app|main|windows)\.rs$' --fail-under-lines 90
+```
+
 Use focused commits and describe observable behavior, platform coverage, and remaining test gaps in the pull request.
