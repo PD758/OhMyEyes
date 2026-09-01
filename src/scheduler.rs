@@ -232,4 +232,87 @@ mod tests {
         assert_eq!(scheduler.tick(TWENTY_SECONDS), SchedulerAction::Hide);
         assert_eq!(scheduler.next_wake_in(TWENTY_SECONDS), None);
     }
+
+    #[test]
+    fn next_wake_tracks_waiting_and_showing_deadlines() {
+        let mut scheduler = scheduler();
+
+        assert_eq!(scheduler.next_wake_in(5 * MINUTE), Some(15 * MINUTE));
+        assert_eq!(scheduler.tick(20 * MINUTE), SchedulerAction::Show);
+        assert_eq!(
+            scheduler.next_wake_in(20 * MINUTE + Duration::from_secs(5)),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(scheduler.next_wake_in(21 * MINUTE), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn repeated_manual_reminder_restarts_its_visible_duration() {
+        let mut scheduler = scheduler();
+
+        assert_eq!(scheduler.show_now(Duration::ZERO), SchedulerAction::Show);
+        assert_eq!(
+            scheduler.show_now(Duration::from_secs(10)),
+            SchedulerAction::Show
+        );
+        assert_eq!(scheduler.tick(TWENTY_SECONDS), SchedulerAction::None);
+        assert_eq!(
+            scheduler.tick(Duration::from_secs(30)),
+            SchedulerAction::Hide
+        );
+    }
+
+    #[test]
+    fn break_hides_an_active_reminder_and_continues_with_a_full_interval() {
+        let mut scheduler = scheduler();
+        scheduler.show_now(Duration::ZERO);
+
+        assert_eq!(scheduler.begin_break(5 * MINUTE), SchedulerAction::Hide);
+        assert!(!scheduler.is_showing());
+        scheduler.end_break(100 * MINUTE, ResumePolicy::Continue);
+
+        assert_eq!(scheduler.tick(119 * MINUTE), SchedulerAction::None);
+        assert_eq!(scheduler.tick(120 * MINUTE), SchedulerAction::Show);
+    }
+
+    #[test]
+    fn break_cancels_a_manual_reminder_without_enabling_scheduling() {
+        let mut scheduler =
+            ReminderScheduler::new(Duration::ZERO, 20 * MINUTE, TWENTY_SECONDS, false);
+        scheduler.show_now(Duration::ZERO);
+
+        assert_eq!(scheduler.begin_break(MINUTE), SchedulerAction::Hide);
+        scheduler.end_break(10 * MINUTE, ResumePolicy::Reset);
+
+        assert_eq!(scheduler.next_wake_in(10 * MINUTE), None);
+        assert_eq!(scheduler.tick(100 * MINUTE), SchedulerAction::None);
+    }
+
+    #[test]
+    fn duplicate_break_notification_preserves_the_original_remaining_time() {
+        let mut scheduler = scheduler();
+
+        assert_eq!(scheduler.begin_break(5 * MINUTE), SchedulerAction::None);
+        assert_eq!(scheduler.begin_break(10 * MINUTE), SchedulerAction::None);
+        scheduler.end_break(100 * MINUTE, ResumePolicy::Continue);
+
+        assert_eq!(scheduler.tick(114 * MINUTE), SchedulerAction::None);
+        assert_eq!(scheduler.tick(115 * MINUTE), SchedulerAction::Show);
+    }
+
+    #[test]
+    fn reset_replaces_waiting_interval_and_overlay_duration() {
+        let mut scheduler = scheduler();
+        let five_seconds = Duration::from_secs(5);
+
+        assert_eq!(
+            scheduler.reset(5 * MINUTE, 2 * MINUTE, five_seconds, true),
+            SchedulerAction::None
+        );
+        assert_eq!(scheduler.tick(7 * MINUTE), SchedulerAction::Show);
+        assert_eq!(
+            scheduler.tick(7 * MINUTE + five_seconds),
+            SchedulerAction::Hide
+        );
+    }
 }

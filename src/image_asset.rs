@@ -291,6 +291,44 @@ mod tests {
     }
 
     #[test]
+    fn static_image_timing_and_frame_fallback_are_stable() {
+        let image = decoded_image_from_frames(
+            [1, 1],
+            vec![DecodedFrame {
+                rgba: Arc::from([10, 20, 30, 255]),
+                duration: Duration::ZERO,
+            }],
+        )
+        .expect("static image should be created");
+
+        assert!(!image.is_animated());
+        assert_eq!(image.frame_at(Duration::from_secs(10)), (0, Duration::MAX));
+        assert_eq!(image.frame_or_first(99).rgba.as_ref(), [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn gif_frame_delays_are_clamped_to_safe_bounds() {
+        let bytes = encode_gif(vec![
+            gif_frame([255, 0, 0, 255], 1),
+            gif_frame([0, 255, 0, 255], 61_000),
+        ]);
+        let image = decode(&bytes).expect("GIF should decode");
+
+        assert_eq!(image.frame_or_first(0).duration, MIN_FRAME_DURATION);
+        assert_eq!(image.frame_or_first(1).duration, MAX_FRAME_DURATION);
+        assert_eq!(image.frame_at(Duration::ZERO), (0, MIN_FRAME_DURATION));
+        assert_eq!(image.frame_at(MIN_FRAME_DURATION), (1, MAX_FRAME_DURATION));
+    }
+
+    #[test]
+    fn gif_cycle_duration_is_bounded() {
+        let frames = (0..6).map(|_| gif_frame([0, 0, 0, 0], 60_000)).collect();
+        let error = decode(&encode_gif(frames)).expect_err("long GIF should be rejected");
+
+        assert!(matches!(error, ImageAssetError::AnimationTooLong));
+    }
+
+    #[test]
     fn gif_frame_count_is_bounded() {
         let frames = (0..=MAX_GIF_FRAMES)
             .map(|_| gif_frame([0, 0, 0, 0], 20))
@@ -334,6 +372,52 @@ mod tests {
         let error = decode_svg(&oversized).expect_err("oversized SVG should be rejected");
 
         assert!(matches!(error, ImageAssetError::SvgTooLarge));
+    }
+
+    #[test]
+    fn invalid_and_oversized_svg_dimensions_are_reported() {
+        let parse_error = decode_svg(b"not an svg").expect_err("invalid SVG should be rejected");
+        assert!(matches!(parse_error, ImageAssetError::SvgParse(_)));
+
+        let oversized = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4097" height="1"/>"#;
+        let size_error = decode_svg(oversized).expect_err("wide SVG should be rejected");
+        assert!(matches!(size_error, ImageAssetError::DimensionsTooLarge));
+    }
+
+    #[test]
+    fn image_dimension_boundaries_are_enforced() {
+        assert!(validate_dimensions(1, 1).is_ok());
+        assert!(validate_dimensions(MAX_DIMENSION, MAX_DIMENSION).is_ok());
+        assert!(matches!(
+            validate_dimensions(0, 1),
+            Err(ImageAssetError::DimensionsTooLarge)
+        ));
+        assert!(matches!(
+            validate_dimensions(MAX_DIMENSION + 1, 1),
+            Err(ImageAssetError::DimensionsTooLarge)
+        ));
+    }
+
+    #[test]
+    fn unpremultiplication_handles_transparent_partial_and_opaque_pixels() {
+        let mut rgba = [1, 2, 3, 0, 64, 32, 16, 128, 9, 8, 7, 255];
+
+        unpremultiply_rgba(&mut rgba);
+
+        assert_eq!(rgba, [0, 0, 0, 0, 128, 64, 32, 128, 9, 8, 7, 255]);
+    }
+
+    #[test]
+    fn file_size_is_checked_before_decoding() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("large.png");
+        let file = fs::File::create(&path).expect("large test file should be created");
+        file.set_len(MAX_FILE_SIZE + 1)
+            .expect("large test file should be resized");
+
+        let error = load_file(&path).expect_err("large image should be rejected");
+
+        assert!(matches!(error, ImageAssetError::TooLarge));
     }
 
     fn gif_frame(color: [u8; 4], duration_ms: u32) -> Frame {

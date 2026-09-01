@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "OhMyEyes",
         options,
-        Box::new(move |cc| Ok(Box::new(OhMyEyesApp::new(cc, background)))),
+        Box::new(move |cc| Ok(Box::new(OhMyEyesApp::new(cc, background, show_now)))),
     )?;
     Ok(())
 }
