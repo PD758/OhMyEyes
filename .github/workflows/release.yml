@@ -17,6 +17,8 @@ jobs:
         with:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
       - name: Verify release tag
         shell: pwsh
         run: .\scripts\check-release-version.ps1

@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
+use crate::limited_read::{self, LimitedReadError};
+
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
-const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
+const MAX_CONFIG_FILE_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -196,10 +198,11 @@ impl ConfigStore {
             });
         }
 
-        if fs::metadata(&self.path)?.len() > MAX_CONFIG_FILE_SIZE {
-            return Err(ConfigError::TooLarge);
-        }
-        let bytes = fs::read(&self.path)?;
+        let bytes = match limited_read::read_file(&self.path, MAX_CONFIG_FILE_SIZE) {
+            Ok(bytes) => bytes,
+            Err(LimitedReadError::TooLarge) => return Err(ConfigError::TooLarge),
+            Err(LimitedReadError::Io(error)) => return Err(ConfigError::Io(error)),
+        };
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         let schema_version = value
             .get("schema_version")
@@ -404,7 +407,7 @@ mod tests {
     fn oversized_configuration_is_rejected_before_parsing() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let path = directory.path().join("config.json");
-        fs::write(&path, vec![b' '; MAX_CONFIG_FILE_SIZE as usize + 1])
+        fs::write(&path, vec![b' '; MAX_CONFIG_FILE_SIZE + 1])
             .expect("oversized test configuration should save");
 
         let error = ConfigStore::new(path)

@@ -19,7 +19,11 @@ All notable changes to this project will be documented here. The format follows 
 ### Changed
 
 - Extreme image aspect ratios are fitted to the monitor before overlay rasterization.
-- Single-instance activation retries startup races and bounds IPC reads by size and time.
+- The single-instance IPC endpoint is bound before configuration and image loading.
+- Windows lock notifications retry while Remote Desktop Services starts and report failures in settings.
+- Animated overlays reuse image-sized CPU and GDI buffers instead of rebuilding monitor-sized surfaces.
+- Image and configuration reads enforce their limits on a single open file handle.
+- Windows display selection uses the DisplayConfig monitor device path with legacy ID migration.
 - Interactive settings changes are persisted with a short debounce instead of on every pointer event.
 - Invalid configured images fall back visibly and reset to the bundled image.
 - Windows display geometry refreshes automatically when the monitor topology changes.

@@ -20,9 +20,33 @@ fn overlay_viewport_id() -> egui::ViewportId {
 
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+pub struct AppStartup {
+    commands_tx: Sender<AppCommand>,
+    commands_rx: Receiver<AppCommand>,
+    #[cfg(windows)]
+    ipc_server: Result<crate::windows::IpcServer, String>,
+}
+
+impl AppStartup {
+    pub fn initialize() -> Self {
+        let (commands_tx, commands_rx) = mpsc::channel();
+        #[cfg(windows)]
+        let ipc_server = crate::windows::start_ipc_server(commands_tx.clone())
+            .map_err(|error| error.to_string());
+        Self {
+            commands_tx,
+            commands_rx,
+            #[cfg(windows)]
+            ipc_server,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DisplayInfo {
     id: String,
+    #[cfg(windows)]
+    legacy_id: String,
     label: String,
     #[cfg(not(windows))]
     index: usize,
@@ -56,6 +80,7 @@ pub struct OhMyEyesApp {
     root_controller_mode: bool,
     quitting: bool,
     system_pause_mask: u8,
+    session_notification_status: Option<String>,
     status: Option<String>,
     commands_rx: Receiver<AppCommand>,
     commands_tx: Sender<AppCommand>,
@@ -66,7 +91,18 @@ pub struct OhMyEyesApp {
 }
 
 impl OhMyEyesApp {
-    pub fn new(cc: &CreationContext<'_>, background: bool, show_now: bool) -> Self {
+    pub fn new(
+        cc: &CreationContext<'_>,
+        background: bool,
+        show_now: bool,
+        startup: AppStartup,
+    ) -> Self {
+        let AppStartup {
+            commands_tx,
+            commands_rx,
+            #[cfg(windows)]
+            ipc_server,
+        } = startup;
         configure_style(&cc.egui_ctx);
         let config_store = ConfigStore::for_current_user()
             .unwrap_or_else(|_| ConfigStore::new(PathBuf::from("OhMyEyes-config.json")));
@@ -128,11 +164,37 @@ impl OhMyEyesApp {
         };
         #[cfg(not(windows))]
         let displays = enumerate_displays(cc);
+        #[cfg(windows)]
+        let (selected_display, display_id_migrated) =
+            settings.display_id.as_ref().map_or((0, false), |id| {
+                displays
+                    .iter()
+                    .position(|display| &display.id == id)
+                    .map(|index| (index, false))
+                    .or_else(|| {
+                        displays
+                            .iter()
+                            .position(|display| &display.legacy_id == id)
+                            .map(|index| (index, true))
+                    })
+                    .unwrap_or((0, false))
+            });
+        #[cfg(not(windows))]
         let selected_display = settings
             .display_id
             .as_ref()
             .and_then(|id| displays.iter().position(|display| &display.id == id))
             .unwrap_or(0);
+        #[cfg(windows)]
+        if display_id_migrated && let Some(display) = displays.get(selected_display) {
+            settings.display_id = Some(display.id.clone());
+            if let Err(error) = config_store.save(&settings) {
+                append_status(
+                    &mut status,
+                    format!("Could not migrate the selected display identifier: {error}"),
+                );
+            }
+        }
         let started_at = Instant::now();
         let scheduler = ReminderScheduler::new(
             Duration::ZERO,
@@ -140,25 +202,30 @@ impl OhMyEyesApp {
             settings.overlay_duration(),
             settings.reminders_enabled,
         );
-        let (commands_tx, commands_rx) = mpsc::channel();
         #[cfg(windows)]
-        let ipc_failed = if let Err(error) =
-            crate::windows::start_ipc_server(commands_tx.clone(), cc.egui_ctx.clone())
-        {
-            tracing::warn!(%error, "IPC server could not start");
-            append_status(
-                &mut status,
-                format!("Single-instance activation is unavailable: {error}"),
-            );
-            true
-        } else {
-            false
+        let ipc_failed = match ipc_server {
+            Ok(server) => {
+                server.attach_context(cc.egui_ctx.clone());
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "IPC server could not start");
+                append_status(
+                    &mut status,
+                    format!("Single-instance activation is unavailable: {error}"),
+                );
+                true
+            }
         };
+        let mut session_notification_status = None;
         #[cfg(windows)]
         if let Err(error) =
             crate::windows::start_system_event_monitor(commands_tx.clone(), cc.egui_ctx.clone())
         {
             tracing::warn!(%error, "system event monitor could not start");
+            session_notification_status = Some(format!(
+                "Lock and unlock monitoring is unavailable: {error}"
+            ));
         }
         #[cfg(windows)]
         let overlay = match crate::windows::OverlayController::create() {
@@ -196,6 +263,7 @@ impl OhMyEyesApp {
             root_controller_mode: false,
             quitting: false,
             system_pause_mask: 0,
+            session_notification_status,
             status,
             commands_rx,
             commands_tx,
@@ -344,7 +412,15 @@ impl OhMyEyesApp {
             return;
         }
         self.animation_frame_index = index;
-        let frame = self.image.frame_or_first(index);
+        #[cfg(windows)]
+        if !self.settings_open {
+            return;
+        }
+        self.update_preview_texture(ctx);
+    }
+
+    fn update_preview_texture(&mut self, ctx: &egui::Context) {
+        let frame = self.image.frame_or_first(self.animation_frame_index);
         self.texture.set(
             egui::ColorImage::from_rgba_unmultiplied(
                 [self.image.size[0] as usize, self.image.size[1] as usize],
@@ -410,6 +486,7 @@ impl OhMyEyesApp {
         match command {
             AppCommand::OpenSettings => {
                 self.settings_open = true;
+                self.update_preview_texture(ctx);
                 self.update_root_visibility(ctx);
                 self.initialize_settings_window(ctx);
                 send_root_command(ctx, egui::ViewportCommand::Focus);
@@ -430,6 +507,19 @@ impl OhMyEyesApp {
             AppCommand::DisplayTopologyChanged => {
                 #[cfg(windows)]
                 self.refresh_displays(ctx);
+            }
+            AppCommand::SessionNotificationsDelayed => {
+                self.session_notification_status =
+                    Some("Waiting for Windows lock and unlock notifications...".to_owned());
+            }
+            AppCommand::SessionNotificationsReady => {
+                self.session_notification_status = None;
+            }
+            AppCommand::SessionNotificationsUnavailable(code) => {
+                let error = std::io::Error::from_raw_os_error(code as i32);
+                self.session_notification_status = Some(format!(
+                    "Lock and unlock monitoring is unavailable: {error}"
+                ));
             }
             AppCommand::SystemPause(reason) => {
                 let was_active = self.system_pause_mask != 0;
@@ -473,17 +563,22 @@ impl OhMyEyesApp {
                 return;
             }
         };
-        let selected_display = selected_id
+        let exact_match = selected_id
             .as_ref()
-            .and_then(|id| displays.iter().position(|display| &display.id == id))
-            .unwrap_or(0);
-        let selection_was_removed = selected_id
+            .and_then(|id| displays.iter().position(|display| &display.id == id));
+        let legacy_match = selected_id
             .as_ref()
-            .is_some_and(|id| displays[selected_display].id != *id);
+            .and_then(|id| displays.iter().position(|display| &display.legacy_id == id));
+        let selected_display = exact_match.or(legacy_match).unwrap_or(0);
+        let display_id_migrated = exact_match.is_none() && legacy_match.is_some();
+        let selection_was_removed =
+            selected_id.is_some() && exact_match.is_none() && legacy_match.is_none();
 
         self.displays = displays;
         self.selected_display = selected_display;
-        if selection_was_removed {
+        if display_id_migrated {
+            self.save_settings();
+        } else if selection_was_removed {
             self.save_settings();
             append_status(
                 &mut self.status,
@@ -655,6 +750,9 @@ impl OhMyEyesApp {
                     )
                     .changed();
             });
+            if let Some(status) = &self.session_notification_status {
+                ui.small(status);
+            }
         });
 
         if schedule_changed {
@@ -875,6 +973,7 @@ impl From<crate::windows::NativeDisplay> for DisplayInfo {
     fn from(display: crate::windows::NativeDisplay) -> Self {
         Self {
             id: display.id,
+            legacy_id: display.legacy_id,
             label: display.label,
             left: display.left,
             top: display.top,
