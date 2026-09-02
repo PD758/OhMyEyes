@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, BufRead, BufReader, Read, Write},
     path::Path,
     sync::{
@@ -17,12 +18,19 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
+        QueryDisplayConfig,
+    },
+    Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
         AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
         CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
-        SelectObject,
+        EnumDisplayMonitors, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO,
+        MONITORINFOEXW, SelectObject,
     },
     System::LibraryLoader::GetModuleHandleW,
     System::RemoteDesktop::{
@@ -30,13 +38,14 @@ use windows_sys::Win32::{
     },
     UI::WindowsAndMessaging::{
         CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HTTRANSPARENT, MONITORINFOF_PRIMARY, MSG,
-        PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW, RegisterClassW, SW_HIDE,
-        SW_SHOWNOACTIVATE, SetWindowLongPtrW, ShowWindow, TranslateMessage, ULW_ALPHA,
-        UnregisterClassW, UpdateLayeredWindow, WM_APP, WM_DISPLAYCHANGE, WM_ERASEBKGND,
-        WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE,
-        WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_EX_TRANSPARENT, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+        GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HTTRANSPARENT, KillTimer,
+        MONITORINFOF_PRIMARY, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PostMessageW,
+        RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer, SetWindowLongPtrW, ShowWindow,
+        TranslateMessage, ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow, WM_APP,
+        WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+        WM_POWERBROADCAST, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
     },
 };
 
@@ -47,10 +56,15 @@ const IPC_COMMAND_LIMIT: u64 = 64;
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const OVERLAY_UPDATE_MESSAGE: u32 = WM_APP + 20;
 const MAX_OVERLAY_BYTES: u64 = 256 * 1024 * 1024;
+const SESSION_REGISTRATION_TIMER_ID: usize = 1;
+const SESSION_REGISTRATION_RETRY_MS: u32 = 1_000;
+// windows-sys exposes the NT variant but not this Win32 RPC status code.
+const RPC_S_INVALID_BINDING_CODE: i32 = 1_702;
 
 #[derive(Debug, Clone)]
 pub struct NativeDisplay {
     pub id: String,
+    pub legacy_id: String,
     pub label: String,
     pub left: i32,
     pub top: i32,
@@ -63,33 +77,150 @@ struct EnumeratedDisplay {
     primary: bool,
 }
 
+#[derive(Debug)]
+struct DisplayIdentity {
+    id: String,
+    friendly_name: Option<String>,
+}
+
+struct DisplayEnumeration {
+    displays: Vec<EnumeratedDisplay>,
+    identities: HashMap<String, DisplayIdentity>,
+}
+
 pub fn enumerate_displays() -> io::Result<Vec<NativeDisplay>> {
-    let mut displays = Vec::<EnumeratedDisplay>::new();
+    let identities = match display_config_identities() {
+        Ok(identities) => identities,
+        Err(error) => {
+            tracing::warn!(%error, "stable Windows display identities are unavailable");
+            HashMap::new()
+        }
+    };
+    let mut enumeration = DisplayEnumeration {
+        displays: Vec::new(),
+        identities,
+    };
     let succeeded = unsafe {
         EnumDisplayMonitors(
             std::ptr::null_mut(),
             std::ptr::null(),
             Some(collect_display),
-            (&raw mut displays) as LPARAM,
+            (&raw mut enumeration) as LPARAM,
         )
     };
     if succeeded == 0 {
         return Err(io::Error::last_os_error());
     }
-    displays.sort_by(|left, right| {
+    enumeration.displays.sort_by(|left, right| {
         right
             .primary
             .cmp(&left.primary)
             .then_with(|| left.display.top.cmp(&right.display.top))
             .then_with(|| left.display.left.cmp(&right.display.left))
     });
-    if displays.is_empty() {
+    if enumeration.displays.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "Windows reported no active displays",
         ));
     }
-    Ok(displays.into_iter().map(|entry| entry.display).collect())
+    Ok(enumeration
+        .displays
+        .into_iter()
+        .map(|entry| entry.display)
+        .collect())
+}
+
+fn display_config_identities() -> io::Result<HashMap<String, DisplayIdentity>> {
+    let paths = loop {
+        let mut path_count = 0;
+        let mut mode_count = 0;
+        let result = unsafe {
+            GetDisplayConfigBufferSizes(
+                QDC_ONLY_ACTIVE_PATHS,
+                &raw mut path_count,
+                &raw mut mode_count,
+            )
+        };
+        if result != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        let result = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &raw mut path_count,
+                paths.as_mut_ptr(),
+                &raw mut mode_count,
+                modes.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if result == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        if result != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        paths.truncate(path_count as usize);
+        modes.truncate(mode_count as usize);
+        break paths;
+    };
+
+    let mut identities = HashMap::new();
+    for path in paths {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            viewGdiDeviceName: [0; 32],
+        };
+        if unsafe { DisplayConfigGetDeviceInfo(&raw mut source.header) } != ERROR_SUCCESS as i32 {
+            continue;
+        }
+        let source_name = wide_string(&source.viewGdiDeviceName);
+        if source_name.is_empty() {
+            continue;
+        }
+
+        let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        if unsafe { DisplayConfigGetDeviceInfo(&raw mut target.header) } != ERROR_SUCCESS as i32 {
+            continue;
+        }
+        let device_path = wide_string(&target.monitorDevicePath);
+        if device_path.is_empty() {
+            continue;
+        }
+        let friendly_name = wide_string(&target.monitorFriendlyDeviceName);
+        identities.insert(
+            source_name.to_lowercase(),
+            DisplayIdentity {
+                id: format!("display-path:{}", device_path.to_lowercase()),
+                friendly_name: (!friendly_name.is_empty()).then_some(friendly_name),
+            },
+        );
+    }
+    Ok(identities)
+}
+
+fn wide_string(buffer: &[u16]) -> String {
+    let length = buffer
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..length])
 }
 
 unsafe extern "system" fn collect_display(
@@ -111,28 +242,33 @@ unsafe extern "system" fn collect_display(
         return 1;
     };
 
-    let name_length = info
-        .szDevice
-        .iter()
-        .position(|character| *character == 0)
-        .unwrap_or(info.szDevice.len());
-    let name = String::from_utf16_lossy(&info.szDevice[..name_length]);
-    let id = if name.is_empty() {
+    let name = wide_string(&info.szDevice);
+    let legacy_id = if name.is_empty() {
         format!("display@{},{}", rect.left, rect.top)
     } else {
         name.clone()
     };
-    let label_name = name
+    // EnumDisplayMonitors invokes the callback synchronously while this context is alive.
+    let Some(enumeration) = (unsafe { (data as *mut DisplayEnumeration).as_mut() }) else {
+        return 0;
+    };
+    let identity = enumeration.identities.get(&name.to_lowercase());
+    let id = identity.map_or_else(|| legacy_id.clone(), |identity| identity.id.clone());
+    let fallback_label = name
         .strip_prefix(r"\\.\DISPLAY")
         .map_or_else(|| name.clone(), |number| format!("Display {number}"));
-    let label_name = if label_name.is_empty() {
+    let fallback_label = if fallback_label.is_empty() {
         "Display".to_owned()
     } else {
-        label_name
+        fallback_label
     };
+    let label_name = identity
+        .and_then(|identity| identity.friendly_name.clone())
+        .unwrap_or(fallback_label);
     let entry = EnumeratedDisplay {
         display: NativeDisplay {
             id,
+            legacy_id,
             label: format!("{label_name} ({width} x {height})"),
             left: rect.left,
             top: rect.top,
@@ -141,11 +277,7 @@ unsafe extern "system" fn collect_display(
         },
         primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
     };
-    // EnumDisplayMonitors invokes the callback synchronously while this vector is alive.
-    let Some(displays) = (unsafe { (data as *mut Vec<EnumeratedDisplay>).as_mut() }) else {
-        return 0;
-    };
-    displays.push(entry);
+    enumeration.displays.push(entry);
     1
 }
 
@@ -363,6 +495,8 @@ unsafe fn overlay_message_loop(
         return;
     }
 
+    let mut surface_resources = None;
+    let mut pixel_buffer = Vec::new();
     let mut message: MSG = unsafe { std::mem::zeroed() };
     loop {
         let result = unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) };
@@ -380,7 +514,14 @@ unsafe fn overlay_message_loop(
             if let Some(command) = command {
                 match command {
                     OverlayCommand::Show(frame) => {
-                        if let Err(error) = unsafe { update_layered_overlay(window, &frame) } {
+                        if let Err(error) = unsafe {
+                            update_layered_overlay(
+                                window,
+                                &frame,
+                                &mut surface_resources,
+                                &mut pixel_buffer,
+                            )
+                        } {
                             if let Ok(mut last_error) = last_error.lock() {
                                 *last_error = Some(error.clone());
                             }
@@ -410,13 +551,17 @@ unsafe fn overlay_message_loop(
 }
 
 #[derive(Debug)]
-struct OverlaySurface {
+struct OverlayPlacement {
+    left: i32,
+    top: i32,
     width: i32,
     height: i32,
-    pixels: Vec<u8>,
 }
 
-fn render_overlay_surface(frame: &OverlayFrame) -> Result<OverlaySurface, String> {
+fn render_overlay_surface(
+    frame: &OverlayFrame,
+    pixels: &mut Vec<u8>,
+) -> Result<OverlayPlacement, String> {
     if frame.width == 0 || frame.height == 0 || frame.image_size.contains(&0) {
         return Err("overlay or image dimensions are empty".to_owned());
     }
@@ -426,12 +571,8 @@ fn render_overlay_surface(frame: &OverlayFrame) -> Result<OverlaySurface, String
     if frame.image_rgba.len() != expected_length {
         return Err("image pixel buffer has an invalid length".to_owned());
     }
-    let overlay_width = i32::try_from(frame.width).map_err(|_| "overlay is too wide".to_owned())?;
-    let overlay_height =
-        i32::try_from(frame.height).map_err(|_| "overlay is too tall".to_owned())?;
-    let canvas_length = overlay_canvas_length(frame.width, frame.height)?;
-
     let (target_width, target_height) = scaled_overlay_size(frame);
+    overlay_surface_length(target_width, target_height)?;
     let source = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
         frame.image_size[0],
         frame.image_size[1],
@@ -444,107 +585,168 @@ fn render_overlay_surface(frame: &OverlayFrame) -> Result<OverlaySurface, String
         target_height,
         image::imageops::FilterType::Lanczos3,
     );
-    let mut canvas = Vec::new();
-    canvas
-        .try_reserve_exact(canvas_length)
-        .map_err(|_| "could not allocate the overlay pixel buffer".to_owned())?;
-    canvas.resize(canvas_length, 0_u8);
     let center_x = (frame.position[0].clamp(0.0, 1.0) * frame.width as f32).round() as i64;
     let center_y = (frame.position[1].clamp(0.0, 1.0) * frame.height as f32).round() as i64;
     let origin_x = center_x - i64::from(target_width) / 2;
     let origin_y = center_y - i64::from(target_height) / 2;
+    let visible_left = origin_x.max(0);
+    let visible_top = origin_y.max(0);
+    let visible_right = (origin_x + i64::from(target_width)).min(i64::from(frame.width));
+    let visible_bottom = (origin_y + i64::from(target_height)).min(i64::from(frame.height));
+    let visible_width = u32::try_from(visible_right - visible_left)
+        .map_err(|_| "overlay has no visible width".to_owned())?;
+    let visible_height = u32::try_from(visible_bottom - visible_top)
+        .map_err(|_| "overlay has no visible height".to_owned())?;
+    if visible_width == 0 || visible_height == 0 {
+        return Err("overlay is outside the selected display".to_owned());
+    }
+    let surface_length = overlay_surface_length(visible_width, visible_height)?;
+    pixels.clear();
+    pixels
+        .try_reserve_exact(surface_length)
+        .map_err(|_| "could not allocate the overlay pixel buffer".to_owned())?;
+    pixels.resize(surface_length, 0_u8);
+    let source_left = u32::try_from(visible_left - origin_x)
+        .map_err(|_| "overlay source offset is invalid".to_owned())?;
+    let source_top = u32::try_from(visible_top - origin_y)
+        .map_err(|_| "overlay source offset is invalid".to_owned())?;
     let opacity = u32::from(frame.opacity_percent.min(100)) * 255 / 100;
 
-    for source_y in 0..target_height {
-        let destination_y = origin_y + i64::from(source_y);
-        if !(0..i64::from(frame.height)).contains(&destination_y) {
-            continue;
-        }
-        for source_x in 0..target_width {
-            let destination_x = origin_x + i64::from(source_x);
-            if !(0..i64::from(frame.width)).contains(&destination_x) {
-                continue;
-            }
-            let pixel = scaled.get_pixel(source_x, source_y).0;
-            let alpha = u32::from(pixel[3]) * opacity / 255;
-            let destination_y = u64::try_from(destination_y)
-                .map_err(|_| "overlay pixel row is outside the canvas".to_owned())?;
-            let destination_x = u64::try_from(destination_x)
-                .map_err(|_| "overlay pixel column is outside the canvas".to_owned())?;
-            let destination = (destination_y * u64::from(frame.width) + destination_x) * 4;
-            let destination = usize::try_from(destination)
-                .map_err(|_| "overlay pixel offset is too large".to_owned())?;
-            let output = canvas
-                .get_mut(destination..destination + 4)
-                .ok_or_else(|| "overlay pixel offset is outside the canvas".to_owned())?;
-            output[0] = (u32::from(pixel[2]) * alpha / 255) as u8;
-            output[1] = (u32::from(pixel[1]) * alpha / 255) as u8;
-            output[2] = (u32::from(pixel[0]) * alpha / 255) as u8;
-            output[3] = alpha as u8;
-        }
+    for (index, output) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let index = u32::try_from(index).map_err(|_| "overlay pixel index is too large")?;
+        let source_x = source_left + index % visible_width;
+        let source_y = source_top + index / visible_width;
+        let pixel = scaled.get_pixel(source_x, source_y).0;
+        let alpha = u32::from(pixel[3]) * opacity / 255;
+        output[0] = (u32::from(pixel[2]) * alpha / 255) as u8;
+        output[1] = (u32::from(pixel[1]) * alpha / 255) as u8;
+        output[2] = (u32::from(pixel[0]) * alpha / 255) as u8;
+        output[3] = alpha as u8;
     }
 
-    Ok(OverlaySurface {
-        width: overlay_width,
-        height: overlay_height,
-        pixels: canvas,
+    Ok(OverlayPlacement {
+        left: i32::try_from(i64::from(frame.left) + visible_left)
+            .map_err(|_| "overlay horizontal position is outside Windows coordinates")?,
+        top: i32::try_from(i64::from(frame.top) + visible_top)
+            .map_err(|_| "overlay vertical position is outside Windows coordinates")?,
+        width: i32::try_from(visible_width).map_err(|_| "overlay is too wide")?,
+        height: i32::try_from(visible_height).map_err(|_| "overlay is too tall")?,
     })
 }
 
-unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(), String> {
-    let surface = render_overlay_surface(frame)?;
-    let screen_dc = std::ptr::null_mut();
-    let memory_dc = unsafe { CreateCompatibleDC(screen_dc) };
-    if memory_dc.is_null() {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    let mut bitmap_info: BITMAPINFO = unsafe { std::mem::zeroed() };
-    bitmap_info.bmiHeader = BITMAPINFOHEADER {
-        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: surface.width,
-        biHeight: -surface.height,
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: BI_RGB,
-        ..unsafe { std::mem::zeroed() }
-    };
-    let mut bits = std::ptr::null_mut();
-    let bitmap = unsafe {
-        CreateDIBSection(
-            memory_dc,
-            &raw const bitmap_info,
-            DIB_RGB_COLORS,
-            &raw mut bits,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if bitmap.is_null() || bits.is_null() {
-        let error = io::Error::last_os_error().to_string();
-        unsafe {
-            if !bitmap.is_null() {
-                DeleteObject(bitmap);
+struct GdiSurface {
+    memory_dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+    length: usize,
+}
+
+impl GdiSurface {
+    unsafe fn create(width: i32, height: i32, length: usize) -> Result<Self, String> {
+        let memory_dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
+        if memory_dc.is_null() {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let mut bitmap_info: BITMAPINFO = unsafe { std::mem::zeroed() };
+        bitmap_info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..unsafe { std::mem::zeroed() }
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = unsafe {
+            CreateDIBSection(
+                memory_dc,
+                &raw const bitmap_info,
+                DIB_RGB_COLORS,
+                &raw mut bits,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if bitmap.is_null() || bits.is_null() {
+            let error = io::Error::last_os_error().to_string();
+            unsafe {
+                if !bitmap.is_null() {
+                    DeleteObject(bitmap);
+                }
+                DeleteDC(memory_dc);
             }
-            DeleteDC(memory_dc);
+            return Err(error);
         }
-        return Err(error);
+        let previous = unsafe { SelectObject(memory_dc, bitmap) };
+        if previous.is_null() {
+            let error = io::Error::last_os_error().to_string();
+            unsafe {
+                DeleteObject(bitmap);
+                DeleteDC(memory_dc);
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            memory_dc,
+            bitmap,
+            previous,
+            bits: bits.cast(),
+            width,
+            height,
+            length,
+        })
     }
-    // A 32-bpp DIB has one four-byte pixel per canvas pixel, with no row padding.
-    unsafe {
-        std::ptr::copy_nonoverlapping(surface.pixels.as_ptr(), bits.cast(), surface.pixels.len())
-    };
-    let previous = unsafe { SelectObject(memory_dc, bitmap) };
-    if previous.is_null() {
-        let error = io::Error::last_os_error().to_string();
+
+    fn matches(&self, surface: &OverlayPlacement, pixel_length: usize) -> bool {
+        self.width == surface.width && self.height == surface.height && self.length == pixel_length
+    }
+
+    unsafe fn copy_pixels(&self, pixels: &[u8]) {
+        debug_assert_eq!(self.length, pixels.len());
+        unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), self.bits, pixels.len()) };
+    }
+}
+
+impl Drop for GdiSurface {
+    fn drop(&mut self) {
         unsafe {
-            DeleteObject(bitmap);
-            DeleteDC(memory_dc);
+            let restored = SelectObject(self.memory_dc, self.previous);
+            if restored.is_null() {
+                DeleteDC(self.memory_dc);
+                DeleteObject(self.bitmap);
+            } else {
+                DeleteObject(self.bitmap);
+                DeleteDC(self.memory_dc);
+            }
         }
-        return Err(error);
     }
+}
+
+unsafe fn update_layered_overlay(
+    window: HWND,
+    frame: &OverlayFrame,
+    resources: &mut Option<GdiSurface>,
+    pixel_buffer: &mut Vec<u8>,
+) -> Result<(), String> {
+    let surface = render_overlay_surface(frame, pixel_buffer)?;
+    if resources
+        .as_ref()
+        .is_none_or(|resources| !resources.matches(&surface, pixel_buffer.len()))
+    {
+        *resources =
+            Some(unsafe { GdiSurface::create(surface.width, surface.height, pixel_buffer.len()) }?);
+    }
+    let resources = resources
+        .as_ref()
+        .ok_or_else(|| "overlay GDI surface is unavailable".to_owned())?;
+    unsafe { resources.copy_pixels(pixel_buffer) };
     let destination = windows_sys::Win32::Foundation::POINT {
-        x: frame.left,
-        y: frame.top,
+        x: surface.left,
+        y: surface.top,
     };
     let size = windows_sys::Win32::Foundation::SIZE {
         cx: surface.width,
@@ -560,31 +762,18 @@ unsafe fn update_layered_overlay(window: HWND, frame: &OverlayFrame) -> Result<(
     let updated = unsafe {
         UpdateLayeredWindow(
             window,
-            screen_dc,
+            std::ptr::null_mut(),
             &raw const destination,
             &raw const size,
-            memory_dc,
+            resources.memory_dc,
             &raw const source_point,
             0,
             &raw const blend,
             ULW_ALPHA,
         )
     };
-    let update_error = (updated == 0).then(|| io::Error::last_os_error().to_string());
-    let restored = unsafe { SelectObject(memory_dc, previous) };
-    if restored.is_null() {
-        unsafe {
-            DeleteDC(memory_dc);
-            DeleteObject(bitmap);
-        }
-        return Err("could not restore the previous GDI bitmap".to_owned());
-    }
-    unsafe {
-        DeleteObject(bitmap);
-        DeleteDC(memory_dc);
-    }
-    if let Some(error) = update_error {
-        return Err(error);
+    if updated == 0 {
+        return Err(io::Error::last_os_error().to_string());
     }
     unsafe { ShowWindow(window, SW_SHOWNOACTIVATE) };
     Ok(())
@@ -607,7 +796,7 @@ fn scaled_overlay_size(frame: &OverlayFrame) -> (u32, u32) {
     (width, frame.height)
 }
 
-fn overlay_canvas_length(width: u32, height: u32) -> Result<usize, String> {
+fn overlay_surface_length(width: u32, height: u32) -> Result<usize, String> {
     let bytes = u64::from(width) * u64::from(height) * 4;
     if bytes > MAX_OVERLAY_BYTES {
         return Err("overlay pixel buffer exceeds 256 MiB".to_owned());
@@ -647,9 +836,24 @@ pub fn notify_running_instance(command: AppCommand) -> io::Result<()> {
     }
 }
 
-pub fn start_ipc_server(sender: Sender<AppCommand>, context: egui::Context) -> io::Result<()> {
+pub struct IpcServer {
+    context: Arc<Mutex<Option<egui::Context>>>,
+}
+
+impl IpcServer {
+    pub fn attach_context(self, context: egui::Context) {
+        context.request_repaint();
+        if let Ok(mut slot) = self.context.lock() {
+            *slot = Some(context);
+        }
+    }
+}
+
+pub fn start_ipc_server(sender: Sender<AppCommand>) -> io::Result<IpcServer> {
     let name = IPC_NAME.to_ns_name::<GenericNamespaced>()?;
     let listener = ListenerOptions::new().name(name).create_sync()?;
+    let context = Arc::new(Mutex::new(None::<egui::Context>));
+    let worker_context = Arc::clone(&context);
     thread::Builder::new()
         .name("ohmyeyes-ipc".to_owned())
         .spawn(move || {
@@ -674,11 +878,15 @@ pub fn start_ipc_server(sender: Sender<AppCommand>, context: egui::Context) -> i
                     if let Some(app_command) = app_command {
                         let _ = sender.send(app_command);
                     }
-                    context.request_repaint();
+                    if let Ok(context) = worker_context.lock()
+                        && let Some(context) = context.as_ref()
+                    {
+                        context.request_repaint();
+                    }
                 }
             }
         })?;
-    Ok(())
+    Ok(IpcServer { context })
 }
 
 struct SystemEventContext {
@@ -724,6 +932,7 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
     if instance.is_null() {
         let error = io::Error::last_os_error();
         tracing::warn!(%error, "current Windows module handle is unavailable");
+        notify_system_event_error(&sender, &context, &error);
         return;
     }
     let window_class = WNDCLASSW {
@@ -735,6 +944,7 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
     if unsafe { RegisterClassW(&raw const window_class) } == 0 {
         let error = io::Error::last_os_error();
         tracing::warn!(%error, "system event window class could not be registered");
+        notify_system_event_error(&sender, &context, &error);
         return;
     }
 
@@ -758,17 +968,47 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
     };
     if window.is_null() {
         let error = io::Error::last_os_error();
-        drop(unsafe { Box::from_raw(state_pointer) });
+        let state = unsafe { Box::from_raw(state_pointer) };
+        notify_system_event_error(&state.sender, &state.context, &error);
+        drop(state);
         unsafe { UnregisterClassW(CLASS_NAME.as_ptr(), instance) };
         tracing::warn!(%error, "system event window could not be created");
         return;
     }
 
-    let session_notifications_registered =
-        unsafe { WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) } != 0;
-    if !session_notifications_registered {
-        let error = io::Error::last_os_error();
-        tracing::warn!(%error, "Windows session notifications could not be registered");
+    let mut session_notifications_registered = false;
+    let mut session_retry_timer_active = false;
+    match unsafe { register_session_notifications(window) } {
+        SessionRegistration::Registered => {
+            session_notifications_registered = true;
+            notify_system_event_state(state_pointer, AppCommand::SessionNotificationsReady);
+        }
+        SessionRegistration::Retry => {
+            notify_system_event_state(state_pointer, AppCommand::SessionNotificationsDelayed);
+            session_retry_timer_active = unsafe {
+                SetTimer(
+                    window,
+                    SESSION_REGISTRATION_TIMER_ID,
+                    SESSION_REGISTRATION_RETRY_MS,
+                    None,
+                )
+            } != 0;
+            if !session_retry_timer_active {
+                let error = io::Error::last_os_error();
+                tracing::warn!(%error, "Windows session notification retry timer could not start");
+                notify_system_event_state(
+                    state_pointer,
+                    AppCommand::SessionNotificationsUnavailable(error_code(&error)),
+                );
+            }
+        }
+        SessionRegistration::Failed(error) => {
+            tracing::warn!(%error, "Windows session notifications could not be registered");
+            notify_system_event_state(
+                state_pointer,
+                AppCommand::SessionNotificationsUnavailable(error_code(&error)),
+            );
+        }
     }
     let mut message: MSG = unsafe { std::mem::zeroed() };
     loop {
@@ -776,10 +1016,33 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
         if result == -1 {
             let error = io::Error::last_os_error();
             tracing::error!(%error, "system event message loop failed");
+            let state = unsafe { &*state_pointer };
+            notify_system_event_error(&state.sender, &state.context, &error);
             break;
         }
         if result == 0 {
             break;
+        }
+        if message.message == WM_TIMER && message.wParam == SESSION_REGISTRATION_TIMER_ID {
+            match unsafe { register_session_notifications(window) } {
+                SessionRegistration::Registered => {
+                    session_notifications_registered = true;
+                    session_retry_timer_active = false;
+                    unsafe { KillTimer(window, SESSION_REGISTRATION_TIMER_ID) };
+                    notify_system_event_state(state_pointer, AppCommand::SessionNotificationsReady);
+                }
+                SessionRegistration::Retry => {}
+                SessionRegistration::Failed(error) => {
+                    session_retry_timer_active = false;
+                    unsafe { KillTimer(window, SESSION_REGISTRATION_TIMER_ID) };
+                    tracing::warn!(%error, "Windows session notifications could not be registered");
+                    notify_system_event_state(
+                        state_pointer,
+                        AppCommand::SessionNotificationsUnavailable(error_code(&error)),
+                    );
+                }
+            }
+            continue;
         }
         unsafe {
             TranslateMessage(&raw const message);
@@ -787,6 +1050,9 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
         }
     }
     unsafe {
+        if session_retry_timer_active {
+            KillTimer(window, SESSION_REGISTRATION_TIMER_ID);
+        }
         if session_notifications_registered {
             WTSUnRegisterSessionNotification(window);
         }
@@ -794,6 +1060,54 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
         UnregisterClassW(CLASS_NAME.as_ptr(), instance);
         drop(Box::from_raw(state_pointer));
     }
+}
+
+enum SessionRegistration {
+    Registered,
+    Retry,
+    Failed(io::Error),
+}
+
+unsafe fn register_session_notifications(window: HWND) -> SessionRegistration {
+    if unsafe { WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) } != 0 {
+        return SessionRegistration::Registered;
+    }
+    let error = io::Error::last_os_error();
+    if should_retry_session_registration(&error) {
+        SessionRegistration::Retry
+    } else {
+        SessionRegistration::Failed(error)
+    }
+}
+
+fn should_retry_session_registration(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(RPC_S_INVALID_BINDING_CODE)
+}
+
+fn error_code(error: &io::Error) -> u32 {
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .unwrap_or_default()
+}
+
+fn notify_system_event_state(state: *mut SystemEventContext, command: AppCommand) {
+    let Some(state) = (unsafe { state.as_ref() }) else {
+        return;
+    };
+    let _ = state.sender.send(command);
+    state.context.request_repaint();
+}
+
+fn notify_system_event_error(
+    sender: &Sender<AppCommand>,
+    context: &egui::Context,
+    error: &io::Error,
+) {
+    let _ = sender.send(AppCommand::SessionNotificationsUnavailable(error_code(
+        error,
+    )));
+    context.request_repaint();
 }
 
 unsafe extern "system" fn system_event_window_proc(
@@ -1027,9 +1341,38 @@ mod tests {
     }
 
     #[test]
-    fn overlay_canvas_allocation_is_bounded() {
-        assert_eq!(overlay_canvas_length(1_920, 1_080), Ok(8_294_400));
-        assert!(overlay_canvas_length(16_384, 16_384).is_err());
+    fn overlay_surface_allocation_is_bounded() {
+        assert_eq!(overlay_surface_length(1_920, 1_080), Ok(8_294_400));
+        assert!(overlay_surface_length(16_384, 16_384).is_err());
+    }
+
+    #[test]
+    fn rendered_surface_uses_only_the_visible_image_bounds() {
+        let mut frame = overlay_frame([400, 200]);
+        frame.image_rgba = vec![255; 400 * 200 * 4].into();
+        let mut pixels = Vec::new();
+
+        let surface = render_overlay_surface(&frame, &mut pixels).expect("surface should render");
+
+        assert_eq!((surface.left, surface.top), (720, 420));
+        assert_eq!((surface.width, surface.height), (480, 240));
+        assert_eq!(pixels.len(), 480 * 240 * 4);
+        let allocation = pixels.as_ptr();
+        render_overlay_surface(&frame, &mut pixels).expect("surface should render again");
+        assert_eq!(pixels.as_ptr(), allocation);
+    }
+
+    #[test]
+    fn rendered_surface_clips_at_the_selected_display_edge() {
+        let mut frame = overlay_frame([400, 200]);
+        frame.position = [0.0, 0.0];
+        frame.image_rgba = vec![255; 400 * 200 * 4].into();
+        let mut pixels = Vec::new();
+
+        let surface = render_overlay_surface(&frame, &mut pixels).expect("surface should render");
+
+        assert_eq!((surface.left, surface.top), (0, 0));
+        assert_eq!((surface.width, surface.height), (240, 120));
     }
 
     #[test]
@@ -1040,21 +1383,55 @@ mod tests {
         frame.width_percent = 50;
         frame.opacity_percent = u8::MAX;
         frame.image_rgba = Arc::from([100, 50, 25, 128]);
+        let mut pixels = Vec::new();
 
-        let surface = render_overlay_surface(&frame).expect("surface should render");
+        let surface = render_overlay_surface(&frame, &mut pixels).expect("surface should render");
 
-        assert_eq!((surface.width, surface.height), (2, 2));
-        assert_eq!(&surface.pixels[..12], &[0; 12]);
-        assert_eq!(&surface.pixels[12..], &[12, 25, 50, 128]);
+        assert_eq!((surface.left, surface.top), (1, 1));
+        assert_eq!((surface.width, surface.height), (1, 1));
+        assert_eq!(pixels, [12, 25, 50, 128]);
+    }
+
+    #[test]
+    fn bundled_eye_produces_visible_native_overlay_pixels() {
+        let image = crate::image_asset::load_default().expect("bundled eye should decode");
+        let mut frame = overlay_frame(image.size);
+        frame.image_rgba = Arc::clone(&image.frame_or_first(0).rgba);
+        let mut pixels = Vec::new();
+
+        render_overlay_surface(&frame, &mut pixels).expect("surface should render");
+
+        assert!(pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0));
+        assert!(pixels.len() < frame.width as usize * frame.height as usize * 4);
     }
 
     #[test]
     fn rendered_surface_rejects_invalid_pixel_buffer() {
         let frame = overlay_frame([1, 1]);
+        let mut pixels = Vec::new();
 
-        let error = render_overlay_surface(&frame).expect_err("empty pixels should be rejected");
+        let error = render_overlay_surface(&frame, &mut pixels)
+            .expect_err("empty pixels should be rejected");
 
         assert_eq!(error, "image pixel buffer has an invalid length");
+    }
+
+    #[test]
+    fn session_registration_retries_only_the_documented_startup_error() {
+        assert!(should_retry_session_registration(
+            &io::Error::from_raw_os_error(RPC_S_INVALID_BINDING_CODE)
+        ));
+        assert!(!should_retry_session_registration(
+            &io::Error::from_raw_os_error(5)
+        ));
+    }
+
+    #[test]
+    fn wide_strings_stop_at_the_first_null() {
+        assert_eq!(
+            wide_string(&[b'A' as u16, b'B' as u16, 0, b'C' as u16]),
+            "AB"
+        );
     }
 
     #[test]
@@ -1079,8 +1456,10 @@ mod tests {
                 )
             };
             if succeeded != 0 && rect.right > rect.left && rect.bottom > rect.top {
-                assert_eq!(rect.right - rect.left, 320);
-                assert_eq!(rect.bottom - rect.top, 200);
+                assert_eq!(rect.left, 130);
+                assert_eq!(rect.top, 80);
+                assert_eq!(rect.right - rect.left, 80);
+                assert_eq!(rect.bottom - rect.top, 80);
                 break;
             }
             assert!(

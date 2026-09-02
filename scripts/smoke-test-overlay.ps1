@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $binaryPath = Join-Path $root $Binary
 $captureDirectory = Join-Path $root "target\smoke"
+$smokeLocalAppData = Join-Path $captureDirectory "local-app-data"
 if (-not (Test-Path -LiteralPath $binaryPath)) {
     throw "Binary not found at $binaryPath."
 }
@@ -28,6 +29,9 @@ public static class OhMyEyesWindowTest {
 
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr window, out Rect rect);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
 
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
@@ -101,6 +105,9 @@ function Get-WindowRect([IntPtr]$Window) {
 }
 
 $primary = $null
+$originalLocalAppData = $env:LOCALAPPDATA
+$env:LOCALAPPDATA = $smokeLocalAppData
+New-Item -ItemType Directory -Force -Path $smokeLocalAppData | Out-Null
 try {
     $primary = Start-Process -FilePath $binaryPath -ArgumentList "--show-now" -PassThru
     Start-Sleep -Seconds 4
@@ -127,14 +134,16 @@ try {
     if ($activation.ExitCode -ne 0) {
         throw "Show-now activation failed with code $($activation.ExitCode)."
     }
-    Start-Sleep -Seconds 3
     $overlayWindow = [IntPtr]::Zero
     $overlayRect = $null
     $overlayDeadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         $overlayWindow = [OhMyEyesWindowTest]::FindWindow($primary.Id, "OhMyEyes reminder")
-        if ($overlayWindow -ne [IntPtr]::Zero) {
+        if ($overlayWindow -ne [IntPtr]::Zero -and
+            [OhMyEyesWindowTest]::IsWindowVisible($overlayWindow)) {
             $overlayRect = Get-WindowRect $overlayWindow
+        } else {
+            $overlayRect = $null
         }
         if (-not $overlayRect -or
             $overlayRect.Right -le $overlayRect.Left -or
@@ -190,4 +199,5 @@ finally {
         Stop-Process -Id $primary.Id
         $primary.WaitForExit()
     }
+    $env:LOCALAPPDATA = $originalLocalAppData
 }

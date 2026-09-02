@@ -3,7 +3,10 @@
 use std::{error::Error, path::PathBuf};
 
 use eframe::egui;
-use ohmyeyes::{app::OhMyEyesApp, image_asset};
+use ohmyeyes::{
+    app::{AppStartup, OhMyEyesApp},
+    image_asset,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     init_logging();
@@ -24,6 +27,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         instance
     };
+
+    let startup = AppStartup::initialize();
 
     let icon = image::load_from_memory(image_asset::DEFAULT_EYE_BYTES)
         .ok()
@@ -56,7 +61,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "OhMyEyes",
         options,
-        Box::new(move |cc| Ok(Box::new(OhMyEyesApp::new(cc, background, show_now)))),
+        Box::new(move |cc| {
+            Ok(Box::new(OhMyEyesApp::new(
+                cc, background, show_now, startup,
+            )))
+        }),
     )?;
     Ok(())
 }

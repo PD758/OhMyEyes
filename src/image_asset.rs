@@ -1,5 +1,4 @@
 use std::{
-    fs,
     io::{BufReader, Cursor},
     path::Path,
     sync::Arc,
@@ -12,8 +11,10 @@ use image::{
 };
 use thiserror::Error;
 
+use crate::limited_read::{self, LimitedReadError};
+
 pub const DEFAULT_EYE_BYTES: &[u8] = include_bytes!("../assets/default-eye.png");
-const MAX_FILE_SIZE: u64 = 32 * 1024 * 1024;
+const MAX_FILE_SIZE: usize = 32 * 1024 * 1024;
 const MAX_SVG_FILE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 4_096;
 const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
@@ -95,18 +96,21 @@ pub fn load_default() -> Result<DecodedImage, ImageAssetError> {
 }
 
 pub fn load_file(path: &Path) -> Result<DecodedImage, ImageAssetError> {
-    let metadata = fs::metadata(path)?;
     let is_svg = path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"));
-    if is_svg && metadata.len() > MAX_SVG_FILE_SIZE as u64 {
-        return Err(ImageAssetError::SvgTooLarge);
-    }
-    if metadata.len() > MAX_FILE_SIZE {
-        return Err(ImageAssetError::TooLarge);
-    }
-    let bytes = fs::read(path)?;
+    let limit = if is_svg {
+        MAX_SVG_FILE_SIZE
+    } else {
+        MAX_FILE_SIZE
+    };
+    let bytes = match limited_read::read_file(path, limit) {
+        Ok(bytes) => bytes,
+        Err(LimitedReadError::TooLarge) if is_svg => return Err(ImageAssetError::SvgTooLarge),
+        Err(LimitedReadError::TooLarge) => return Err(ImageAssetError::TooLarge),
+        Err(LimitedReadError::Io(error)) => return Err(ImageAssetError::Io(error)),
+    };
     if is_svg {
         decode_svg(&bytes)
     } else {
@@ -261,6 +265,8 @@ fn decoded_image_from_frames(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use image::{Delay, Frame, Rgba, RgbaImage, codecs::gif::GifEncoder};
 
@@ -412,7 +418,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let path = directory.path().join("large.png");
         let file = fs::File::create(&path).expect("large test file should be created");
-        file.set_len(MAX_FILE_SIZE + 1)
+        file.set_len((MAX_FILE_SIZE + 1) as u64)
             .expect("large test file should be resized");
 
         let error = load_file(&path).expect_err("large image should be rejected");
