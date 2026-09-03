@@ -2,9 +2,11 @@
 
 ## Linux
 
-- [ ] Wayland layer-shell overlay for KDE Plasma, wlroots compositors, and COSMIC.
+- [x] Wayland layer-shell overlay for KDE Plasma, wlroots compositors, and COSMIC.
 - [ ] X11 click-through overlay backend.
 - [ ] GNOME Shell extension integration for GNOME Wayland.
+- [ ] Linux suspend and session-lock integration.
+- [ ] Linux StatusNotifierItem tray integration.
 
 ## Quality
 
