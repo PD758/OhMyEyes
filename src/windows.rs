@@ -1,18 +1,17 @@
 use std::{
     collections::HashMap,
-    io::{self, BufRead, BufReader, Read, Write},
+    io,
     path::Path,
     sync::{
         Arc, Mutex,
         mpsc::{self, Sender},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use auto_launch::{AutoLaunch, WindowsEnableMode};
 use eframe::egui;
-use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, prelude::*};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
@@ -51,11 +50,9 @@ use windows_sys::Win32::{
 
 use crate::{AppCommand, SystemPauseReason, image_asset::DEFAULT_EYE_BYTES};
 
-const IPC_NAME: &str = "app.ohmyeyes.desktop.ipc";
-const IPC_COMMAND_LIMIT: u64 = 64;
-const IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const OVERLAY_UPDATE_MESSAGE: u32 = WM_APP + 20;
 const MAX_OVERLAY_BYTES: u64 = 256 * 1024 * 1024;
+const OVERLAY_INIT_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_REGISTRATION_TIMER_ID: usize = 1;
 const SESSION_REGISTRATION_RETRY_MS: u32 = 1_000;
 // windows-sys exposes the NT variant but not this Win32 RPC status code.
@@ -100,6 +97,8 @@ pub fn enumerate_displays() -> io::Result<Vec<NativeDisplay>> {
         displays: Vec::new(),
         identities,
     };
+    // SAFETY: the callback context points to `enumeration`, which remains alive and
+    // exclusively borrowed for the synchronous duration of EnumDisplayMonitors.
     let succeeded = unsafe {
         EnumDisplayMonitors(
             std::ptr::null_mut(),
@@ -135,6 +134,7 @@ fn display_config_identities() -> io::Result<HashMap<String, DisplayIdentity>> {
     let paths = loop {
         let mut path_count = 0;
         let mut mode_count = 0;
+        // SAFETY: both output count pointers are valid for writes for this call.
         let result = unsafe {
             GetDisplayConfigBufferSizes(
                 QDC_ONLY_ACTIVE_PATHS,
@@ -147,6 +147,8 @@ fn display_config_identities() -> io::Result<HashMap<String, DisplayIdentity>> {
         }
         let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
         let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: the vectors are allocated to the counts returned by Windows, and all
+        // count and buffer pointers remain valid until QueryDisplayConfig returns.
         let result = unsafe {
             QueryDisplayConfig(
                 QDC_ONLY_ACTIVE_PATHS,
@@ -179,6 +181,8 @@ fn display_config_identities() -> io::Result<HashMap<String, DisplayIdentity>> {
             },
             viewGdiDeviceName: [0; 32],
         };
+        // SAFETY: `source` has the required type, size, adapter, and source ID fields,
+        // and its header pointer refers to writable storage for the whole structure.
         if unsafe { DisplayConfigGetDeviceInfo(&raw mut source.header) } != ERROR_SUCCESS as i32 {
             continue;
         }
@@ -196,6 +200,8 @@ fn display_config_identities() -> io::Result<HashMap<String, DisplayIdentity>> {
             },
             ..Default::default()
         };
+        // SAFETY: `target` has the required type, size, adapter, and target ID fields,
+        // and its header pointer refers to writable storage for the whole structure.
         if unsafe { DisplayConfigGetDeviceInfo(&raw mut target.header) } != ERROR_SUCCESS as i32 {
             continue;
         }
@@ -230,9 +236,10 @@ unsafe extern "system" fn collect_display(
     data: LPARAM,
 ) -> i32 {
     let mut info = MONITORINFOEXW::default();
-    info.monitorInfo.cbSize = u32::try_from(std::mem::size_of::<MONITORINFOEXW>())
-        .expect("MONITORINFOEXW size fits in u32");
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     let info_pointer = (&raw mut info).cast::<MONITORINFO>();
+    // SAFETY: Windows supplied `monitor`; `info_pointer` points to a correctly sized,
+    // initialized MONITORINFOEXW whose prefix is MONITORINFO.
     if unsafe { GetMonitorInfoW(monitor, info_pointer) } == 0 {
         return 1;
     }
@@ -249,6 +256,8 @@ unsafe extern "system" fn collect_display(
         name.clone()
     };
     // EnumDisplayMonitors invokes the callback synchronously while this context is alive.
+    // SAFETY: `data` is the pointer passed by `enumerate_displays`, and
+    // EnumDisplayMonitors invokes this callback synchronously before it goes out of scope.
     let Some(enumeration) = (unsafe { (data as *mut DisplayEnumeration).as_mut() }) else {
         return 0;
     };
@@ -366,11 +375,13 @@ impl OverlayController {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("ohmyeyes-overlay".to_owned())
-            .spawn(move || unsafe {
-                overlay_message_loop(worker_pending, worker_last_error, ready_sender)
+            .spawn(move || {
+                overlay_message_loop(worker_pending, worker_last_error, ready_sender);
             })
             .map_err(|error| error.to_string())?;
-        let window = ready_receiver.recv().map_err(|error| error.to_string())??;
+        let window = ready_receiver
+            .recv_timeout(OVERLAY_INIT_TIMEOUT)
+            .map_err(|_| "native overlay initialization timed out".to_owned())??;
         Ok(Self {
             pending,
             last_error,
@@ -428,6 +439,8 @@ impl OverlayController {
     }
 
     fn wake(&self) -> Result<(), String> {
+        // SAFETY: `self.window` is created by the overlay thread and remains valid until
+        // this controller sends Shutdown and joins that thread in Drop.
         let posted = unsafe { PostMessageW(self.window as HWND, OVERLAY_UPDATE_MESSAGE, 0, 0) };
         if posted == 0 {
             Err(io::Error::last_os_error().to_string())
@@ -446,11 +459,12 @@ impl Drop for OverlayController {
     }
 }
 
-unsafe fn overlay_message_loop(
+fn overlay_message_loop(
     pending: Arc<Mutex<Option<OverlayCommand>>>,
     last_error: Arc<Mutex<Option<String>>>,
     ready_sender: mpsc::SyncSender<Result<isize, String>>,
 ) {
+    // SAFETY: a null module name asks Windows for the module of the current process.
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
     if instance.is_null() {
         let _ = ready_sender.send(Err(io::Error::last_os_error().to_string()));
@@ -460,12 +474,16 @@ unsafe fn overlay_message_loop(
         lpfnWndProc: Some(overlay_window_proc),
         hInstance: instance,
         lpszClassName: OVERLAY_CLASS_NAME.as_ptr(),
-        ..unsafe { std::mem::zeroed() }
+        ..Default::default()
     };
+    // SAFETY: all pointers in `window_class` refer to static NUL-terminated strings,
+    // and the callback has the required Windows ABI.
     if unsafe { RegisterClassW(&raw const window_class) } == 0 {
         let _ = ready_sender.send(Err(io::Error::last_os_error().to_string()));
         return;
     }
+    // SAFETY: the registered class and title pointers are valid NUL-terminated UTF-16;
+    // all optional handles and creation data are intentionally null.
     let window = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -484,10 +502,13 @@ unsafe fn overlay_message_loop(
     };
     if window.is_null() {
         let _ = ready_sender.send(Err(io::Error::last_os_error().to_string()));
+        // SAFETY: this thread successfully registered the class above and created no window.
         unsafe { UnregisterClassW(OVERLAY_CLASS_NAME.as_ptr(), instance) };
         return;
     }
     if ready_sender.send(Ok(window as isize)).is_err() {
+        // SAFETY: both the window and its class were created by this thread and have not
+        // yet been destroyed or unregistered.
         unsafe {
             DestroyWindow(window);
             UnregisterClassW(OVERLAY_CLASS_NAME.as_ptr(), instance);
@@ -497,8 +518,10 @@ unsafe fn overlay_message_loop(
 
     let mut surface_resources = None;
     let mut pixel_buffer = Vec::new();
-    let mut message: MSG = unsafe { std::mem::zeroed() };
+    let mut message = MSG::default();
     loop {
+        // SAFETY: `message` is writable for the call; a null HWND intentionally receives
+        // all messages owned by this overlay thread.
         let result = unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) };
         if result == -1 {
             let error = io::Error::last_os_error();
@@ -514,14 +537,12 @@ unsafe fn overlay_message_loop(
             if let Some(command) = command {
                 match command {
                     OverlayCommand::Show(frame) => {
-                        if let Err(error) = unsafe {
-                            update_layered_overlay(
-                                window,
-                                &frame,
-                                &mut surface_resources,
-                                &mut pixel_buffer,
-                            )
-                        } {
+                        if let Err(error) = update_layered_overlay(
+                            window,
+                            &frame,
+                            &mut surface_resources,
+                            &mut pixel_buffer,
+                        ) {
                             if let Ok(mut last_error) = last_error.lock() {
                                 *last_error = Some(error.clone());
                             }
@@ -529,6 +550,7 @@ unsafe fn overlay_message_loop(
                         }
                     }
                     OverlayCommand::Hide => {
+                        // SAFETY: `window` remains owned by this message-loop thread.
                         unsafe { ShowWindow(window, SW_HIDE) };
                     }
                     OverlayCommand::Shutdown => shutdown = true,
@@ -538,12 +560,15 @@ unsafe fn overlay_message_loop(
                 break;
             }
         } else {
+            // SAFETY: `message` was initialized by a successful GetMessageW call.
             unsafe {
                 TranslateMessage(&raw const message);
                 DispatchMessageW(&raw const message);
             }
         }
     }
+    // SAFETY: teardown runs once on the owning thread after the message loop, while
+    // both handles are still valid and no further controller wake can outlive Drop's join.
     unsafe {
         DestroyWindow(window);
         UnregisterClassW(OVERLAY_CLASS_NAME.as_ptr(), instance);
@@ -645,22 +670,28 @@ struct GdiSurface {
 }
 
 impl GdiSurface {
-    unsafe fn create(width: i32, height: i32, length: usize) -> Result<Self, String> {
+    fn create(width: i32, height: i32, length: usize) -> Result<Self, String> {
+        // SAFETY: a null source DC is explicitly supported for a memory DC; the returned
+        // handle is checked before use and owned by the resulting GdiSurface.
         let memory_dc = unsafe { CreateCompatibleDC(std::ptr::null_mut()) };
         if memory_dc.is_null() {
             return Err(io::Error::last_os_error().to_string());
         }
-        let mut bitmap_info: BITMAPINFO = unsafe { std::mem::zeroed() };
-        bitmap_info.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            ..unsafe { std::mem::zeroed() }
+        let bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..Default::default()
+            },
+            ..Default::default()
         };
         let mut bits = std::ptr::null_mut();
+        // SAFETY: `bitmap_info` is a valid 32-bit top-down DIB description, `bits` is a
+        // writable out-pointer, and both GDI handles are checked before use.
         let bitmap = unsafe {
             CreateDIBSection(
                 memory_dc,
@@ -673,6 +704,8 @@ impl GdiSurface {
         };
         if bitmap.is_null() || bits.is_null() {
             let error = io::Error::last_os_error().to_string();
+            // SAFETY: only non-null handles returned by the calls above are released,
+            // and neither has been selected into another DC.
             unsafe {
                 if !bitmap.is_null() {
                     DeleteObject(bitmap);
@@ -681,9 +714,12 @@ impl GdiSurface {
             }
             return Err(error);
         }
+        // SAFETY: `memory_dc` and `bitmap` are valid handles owned by this function.
         let previous = unsafe { SelectObject(memory_dc, bitmap) };
         if previous.is_null() {
             let error = io::Error::last_os_error().to_string();
+            // SAFETY: selection failed, so the bitmap is not selected; both handles are
+            // valid and released exactly once on this error path.
             unsafe {
                 DeleteObject(bitmap);
                 DeleteDC(memory_dc);
@@ -705,14 +741,21 @@ impl GdiSurface {
         self.width == surface.width && self.height == surface.height && self.length == pixel_length
     }
 
-    unsafe fn copy_pixels(&self, pixels: &[u8]) {
-        debug_assert_eq!(self.length, pixels.len());
+    fn copy_pixels(&self, pixels: &[u8]) -> Result<(), String> {
+        if self.length != pixels.len() {
+            return Err("GDI surface and pixel buffer lengths differ".to_owned());
+        }
+        // SAFETY: `bits` points to a DIB allocation of exactly `self.length` bytes,
+        // established by `create`, and the source slice has the same checked length.
         unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), self.bits, pixels.len()) };
+        Ok(())
     }
 }
 
 impl Drop for GdiSurface {
     fn drop(&mut self) {
+        // SAFETY: all handles are private, were created together, and Drop runs once.
+        // Restoring the previous object before deletion follows the GDI ownership rules.
         unsafe {
             let restored = SelectObject(self.memory_dc, self.previous);
             if restored.is_null() {
@@ -726,7 +769,7 @@ impl Drop for GdiSurface {
     }
 }
 
-unsafe fn update_layered_overlay(
+fn update_layered_overlay(
     window: HWND,
     frame: &OverlayFrame,
     resources: &mut Option<GdiSurface>,
@@ -737,13 +780,16 @@ unsafe fn update_layered_overlay(
         .as_ref()
         .is_none_or(|resources| !resources.matches(&surface, pixel_buffer.len()))
     {
-        *resources =
-            Some(unsafe { GdiSurface::create(surface.width, surface.height, pixel_buffer.len()) }?);
+        *resources = Some(GdiSurface::create(
+            surface.width,
+            surface.height,
+            pixel_buffer.len(),
+        )?);
     }
     let resources = resources
         .as_ref()
         .ok_or_else(|| "overlay GDI surface is unavailable".to_owned())?;
-    unsafe { resources.copy_pixels(pixel_buffer) };
+    resources.copy_pixels(pixel_buffer)?;
     let destination = windows_sys::Win32::Foundation::POINT {
         x: surface.left,
         y: surface.top,
@@ -759,6 +805,8 @@ unsafe fn update_layered_overlay(
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
+    // SAFETY: `window` is the live layered window; all geometry/blend pointers refer to
+    // initialized stack values, and `memory_dc` owns a selected bitmap of matching size.
     let updated = unsafe {
         UpdateLayeredWindow(
             window,
@@ -775,6 +823,7 @@ unsafe fn update_layered_overlay(
     if updated == 0 {
         return Err(io::Error::last_os_error().to_string());
     }
+    // SAFETY: `window` remains valid on its owning message-loop thread.
     unsafe { ShowWindow(window, SW_SHOWNOACTIVATE) };
     Ok(())
 }
@@ -813,80 +862,9 @@ unsafe extern "system" fn overlay_window_proc(
     match message {
         WM_NCHITTEST => HTTRANSPARENT as LRESULT,
         WM_ERASEBKGND => 1,
+        // SAFETY: Windows supplied the callback arguments, which are forwarded unchanged.
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
     }
-}
-
-pub fn notify_running_instance(command: AppCommand) -> io::Result<()> {
-    let message = match command {
-        AppCommand::ShowNow => b"show-now\n".as_slice(),
-        _ => b"open-settings\n".as_slice(),
-    };
-    let deadline = Instant::now() + IPC_TIMEOUT;
-    loop {
-        let name = IPC_NAME.to_ns_name::<GenericNamespaced>()?;
-        match Stream::connect(name) {
-            Ok(mut stream) => return stream.write_all(message),
-            Err(error) if Instant::now() < deadline => {
-                tracing::debug!(%error, "waiting for primary instance IPC");
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-pub struct IpcServer {
-    context: Arc<Mutex<Option<egui::Context>>>,
-}
-
-impl IpcServer {
-    pub fn attach_context(self, context: egui::Context) {
-        context.request_repaint();
-        if let Ok(mut slot) = self.context.lock() {
-            *slot = Some(context);
-        }
-    }
-}
-
-pub fn start_ipc_server(sender: Sender<AppCommand>) -> io::Result<IpcServer> {
-    let name = IPC_NAME.to_ns_name::<GenericNamespaced>()?;
-    let listener = ListenerOptions::new().name(name).create_sync()?;
-    let context = Arc::new(Mutex::new(None::<egui::Context>));
-    let worker_context = Arc::clone(&context);
-    thread::Builder::new()
-        .name("ohmyeyes-ipc".to_owned())
-        .spawn(move || {
-            for connection in listener.incoming() {
-                let Ok(connection) = connection else {
-                    continue;
-                };
-                if connection.set_recv_timeout(Some(IPC_TIMEOUT)).is_err() {
-                    continue;
-                }
-                let mut command = String::new();
-                let mut reader = BufReader::new(connection).take(IPC_COMMAND_LIMIT + 1);
-                if reader.read_line(&mut command).is_ok()
-                    && command.len() <= IPC_COMMAND_LIMIT as usize
-                    && command.ends_with('\n')
-                {
-                    let app_command = match command.trim() {
-                        "open-settings" => Some(AppCommand::OpenSettings),
-                        "show-now" => Some(AppCommand::ShowNow),
-                        _ => None,
-                    };
-                    if let Some(app_command) = app_command {
-                        let _ = sender.send(app_command);
-                    }
-                    if let Ok(context) = worker_context.lock()
-                        && let Some(context) = context.as_ref()
-                    {
-                        context.request_repaint();
-                    }
-                }
-            }
-        })?;
-    Ok(IpcServer { context })
 }
 
 struct SystemEventContext {
@@ -900,11 +878,11 @@ pub fn start_system_event_monitor(
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("ohmyeyes-system-events".to_owned())
-        .spawn(move || unsafe { system_event_loop(sender, context) })?;
+        .spawn(move || system_event_loop(sender, context))?;
     Ok(())
 }
 
-unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) {
+fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) {
     const CLASS_NAME: &[u16] = &[
         b'O' as u16,
         b'h' as u16,
@@ -928,6 +906,7 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
         b's' as u16,
         0,
     ];
+    // SAFETY: a null module name asks Windows for the module of the current process.
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
     if instance.is_null() {
         let error = io::Error::last_os_error();
@@ -939,8 +918,10 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
         lpfnWndProc: Some(system_event_window_proc),
         hInstance: instance,
         lpszClassName: CLASS_NAME.as_ptr(),
-        ..unsafe { std::mem::zeroed() }
+        ..Default::default()
     };
+    // SAFETY: the class holds static NUL-terminated strings and a callback with the
+    // required Windows ABI.
     if unsafe { RegisterClassW(&raw const window_class) } == 0 {
         let error = io::Error::last_os_error();
         tracing::warn!(%error, "system event window class could not be registered");
@@ -950,6 +931,8 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
 
     let state = Box::new(SystemEventContext { sender, context });
     let state_pointer = Box::into_raw(state);
+    // SAFETY: the class is registered; the title/class strings are static and valid;
+    // `state_pointer` remains allocated until window teardown or this error path.
     let window = unsafe {
         CreateWindowExW(
             0,
@@ -968,23 +951,31 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
     };
     if window.is_null() {
         let error = io::Error::last_os_error();
+        // SAFETY: ownership came from the single Box::into_raw above and was not
+        // transferred to a successfully created window.
         let state = unsafe { Box::from_raw(state_pointer) };
         notify_system_event_error(&state.sender, &state.context, &error);
         drop(state);
+        // SAFETY: this thread registered the class and no window was created from it.
         unsafe { UnregisterClassW(CLASS_NAME.as_ptr(), instance) };
         tracing::warn!(%error, "system event window could not be created");
         return;
     }
+    // SAFETY: CreateWindowExW succeeded and owns the still-allocated Box pointer as
+    // window userdata until teardown after the message loop.
+    let state = unsafe { &*state_pointer };
 
     let mut session_notifications_registered = false;
     let mut session_retry_timer_active = false;
-    match unsafe { register_session_notifications(window) } {
+    match register_session_notifications(window) {
         SessionRegistration::Registered => {
             session_notifications_registered = true;
-            notify_system_event_state(state_pointer, AppCommand::SessionNotificationsReady);
+            notify_system_event_state(state, AppCommand::SessionNotificationsReady);
         }
         SessionRegistration::Retry => {
-            notify_system_event_state(state_pointer, AppCommand::SessionNotificationsDelayed);
+            notify_system_event_state(state, AppCommand::SessionNotificationsDelayed);
+            // SAFETY: `window` is valid and owned by this thread; the timer ID and callback
+            // mode follow SetTimer's window-timer contract.
             session_retry_timer_active = unsafe {
                 SetTimer(
                     window,
@@ -997,7 +988,7 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
                 let error = io::Error::last_os_error();
                 tracing::warn!(%error, "Windows session notification retry timer could not start");
                 notify_system_event_state(
-                    state_pointer,
+                    state,
                     AppCommand::SessionNotificationsUnavailable(error_code(&error)),
                 );
             }
@@ -1005,18 +996,18 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
         SessionRegistration::Failed(error) => {
             tracing::warn!(%error, "Windows session notifications could not be registered");
             notify_system_event_state(
-                state_pointer,
+                state,
                 AppCommand::SessionNotificationsUnavailable(error_code(&error)),
             );
         }
     }
-    let mut message: MSG = unsafe { std::mem::zeroed() };
+    let mut message = MSG::default();
     loop {
+        // SAFETY: `message` is writable; null HWND receives messages for this thread.
         let result = unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) };
         if result == -1 {
             let error = io::Error::last_os_error();
             tracing::error!(%error, "system event message loop failed");
-            let state = unsafe { &*state_pointer };
             notify_system_event_error(&state.sender, &state.context, &error);
             break;
         }
@@ -1024,31 +1015,36 @@ unsafe fn system_event_loop(sender: Sender<AppCommand>, context: egui::Context) 
             break;
         }
         if message.message == WM_TIMER && message.wParam == SESSION_REGISTRATION_TIMER_ID {
-            match unsafe { register_session_notifications(window) } {
+            match register_session_notifications(window) {
                 SessionRegistration::Registered => {
                     session_notifications_registered = true;
                     session_retry_timer_active = false;
+                    // SAFETY: this timer was created for the same valid window and ID.
                     unsafe { KillTimer(window, SESSION_REGISTRATION_TIMER_ID) };
-                    notify_system_event_state(state_pointer, AppCommand::SessionNotificationsReady);
+                    notify_system_event_state(state, AppCommand::SessionNotificationsReady);
                 }
                 SessionRegistration::Retry => {}
                 SessionRegistration::Failed(error) => {
                     session_retry_timer_active = false;
+                    // SAFETY: this timer was created for the same valid window and ID.
                     unsafe { KillTimer(window, SESSION_REGISTRATION_TIMER_ID) };
                     tracing::warn!(%error, "Windows session notifications could not be registered");
                     notify_system_event_state(
-                        state_pointer,
+                        state,
                         AppCommand::SessionNotificationsUnavailable(error_code(&error)),
                     );
                 }
             }
             continue;
         }
+        // SAFETY: `message` was initialized by a successful GetMessageW call.
         unsafe {
             TranslateMessage(&raw const message);
             DispatchMessageW(&raw const message);
         }
     }
+    // SAFETY: teardown happens once on the owning thread. The callback clears userdata
+    // during DestroyWindow before the Box is reconstructed and dropped exactly once.
     unsafe {
         if session_retry_timer_active {
             KillTimer(window, SESSION_REGISTRATION_TIMER_ID);
@@ -1068,7 +1064,8 @@ enum SessionRegistration {
     Failed(io::Error),
 }
 
-unsafe fn register_session_notifications(window: HWND) -> SessionRegistration {
+fn register_session_notifications(window: HWND) -> SessionRegistration {
+    // SAFETY: the caller supplies the live hidden window owned by the system-event thread.
     if unsafe { WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) } != 0 {
         return SessionRegistration::Registered;
     }
@@ -1091,10 +1088,7 @@ fn error_code(error: &io::Error) -> u32 {
         .unwrap_or_default()
 }
 
-fn notify_system_event_state(state: *mut SystemEventContext, command: AppCommand) {
-    let Some(state) = (unsafe { state.as_ref() }) else {
-        return;
-    };
+fn notify_system_event_state(state: &SystemEventContext, command: AppCommand) {
     let _ = state.sender.send(command);
     state.context.request_repaint();
 }
@@ -1119,10 +1113,14 @@ unsafe extern "system" fn system_event_window_proc(
     if message == WM_NCCREATE {
         let create = lparam as *const CREATESTRUCTW;
         if !create.is_null() {
+            // SAFETY: Windows guarantees lParam points to CREATESTRUCTW for WM_NCCREATE.
             let state = unsafe { (*create).lpCreateParams } as isize;
+            // SAFETY: `window` is the window under creation and GWLP_USERDATA accepts the
+            // application-owned pointer value until WM_NCDESTROY.
             unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, state) };
         }
     }
+    // SAFETY: Windows supplied `window`; reading GWLP_USERDATA does not transfer ownership.
     let state = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } as *const SystemEventContext;
     if !state.is_null() {
         let command = match (message, wparam as u32) {
@@ -1142,14 +1140,18 @@ unsafe extern "system" fn system_event_window_proc(
             _ => None,
         };
         if let Some(command) = command {
+            // SAFETY: non-null userdata is the live SystemEventContext installed at
+            // WM_NCCREATE and cleared before its Box is dropped.
             let state = unsafe { &*state };
             let _ = state.sender.send(command);
             state.context.request_repaint();
         }
     }
     if message == WM_NCDESTROY {
+        // SAFETY: clearing userdata on this valid window prevents later stale-pointer reads.
         unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, 0) };
     }
+    // SAFETY: Windows supplied all callback arguments, which are forwarded unchanged.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
@@ -1260,8 +1262,10 @@ impl Drop for TrayController {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn tall_overlay_image_is_scaled_to_fit_monitor_height() {
@@ -1449,6 +1453,8 @@ mod tests {
                 panic!("overlay worker failed: {error}");
             }
             let mut rect = RECT::default();
+            // SAFETY: the integration test owns `overlay`; its worker keeps the native
+            // window alive until the controller is dropped after this query.
             let succeeded = unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(
                     overlay.window as HWND,

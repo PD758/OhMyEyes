@@ -8,12 +8,15 @@ use eframe::{CreationContext, Frame, egui};
 
 use crate::{
     AppCommand, SystemPauseReason,
-    config::{ConfigStore, ResumePolicy, Settings},
-    image_asset::{DecodedImage, load_default, load_file},
+    config::{ConfigStore, Settings},
+    image_asset::{DecodedImage, ImageAssetError, load_default, load_file},
     scheduler::{ReminderScheduler, SchedulerAction},
 };
 
-#[cfg(not(windows))]
+#[cfg(windows)]
+use crate::config::ResumePolicy;
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn overlay_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("ohmyeyes-overlay")
 }
@@ -23,20 +26,20 @@ const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 pub struct AppStartup {
     commands_tx: Sender<AppCommand>,
     commands_rx: Receiver<AppCommand>,
-    #[cfg(windows)]
-    ipc_server: Result<crate::windows::IpcServer, String>,
+    #[cfg(any(windows, target_os = "linux"))]
+    ipc_server: Result<crate::ipc::IpcServer, String>,
 }
 
 impl AppStartup {
     pub fn initialize() -> Self {
         let (commands_tx, commands_rx) = mpsc::channel();
-        #[cfg(windows)]
-        let ipc_server = crate::windows::start_ipc_server(commands_tx.clone())
-            .map_err(|error| error.to_string());
+        #[cfg(any(windows, target_os = "linux"))]
+        let ipc_server =
+            crate::ipc::start_ipc_server(commands_tx.clone()).map_err(|error| error.to_string());
         Self {
             commands_tx,
             commands_rx,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             ipc_server,
         }
     }
@@ -48,7 +51,7 @@ struct DisplayInfo {
     #[cfg(windows)]
     legacy_id: String,
     label: String,
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     index: usize,
     #[cfg(windows)]
     left: i32,
@@ -76,18 +79,21 @@ pub struct OhMyEyesApp {
     settings_size_initialized: bool,
     settings_save_due_at: Option<Duration>,
     root_visible: bool,
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     root_controller_mode: bool,
     quitting: bool,
     system_pause_mask: u8,
     session_notification_status: Option<String>,
     status: Option<String>,
     commands_rx: Receiver<AppCommand>,
+    #[cfg(windows)]
     commands_tx: Sender<AppCommand>,
     #[cfg(windows)]
     tray: Option<crate::windows::TrayController>,
     #[cfg(windows)]
     overlay: Option<crate::windows::OverlayController>,
+    #[cfg(target_os = "linux")]
+    overlay: Option<crate::linux_wayland::OverlayController>,
 }
 
 impl OhMyEyesApp {
@@ -96,11 +102,11 @@ impl OhMyEyesApp {
         background: bool,
         show_now: bool,
         startup: AppStartup,
-    ) -> Self {
+    ) -> Result<Self, ImageAssetError> {
         let AppStartup {
             commands_tx,
             commands_rx,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             ipc_server,
         } = startup;
         configure_style(&cc.egui_ctx);
@@ -135,10 +141,10 @@ impl OhMyEyesApp {
                     );
                     settings.image_path = None;
                     image_selection_reset = true;
-                    load_default().expect("the bundled eye image must be valid")
+                    load_default()?
                 }
             },
-            None => load_default().expect("the bundled eye image must be valid"),
+            None => load_default()?,
         };
         if image_selection_reset && let Err(error) = config_store.save(&settings) {
             append_status(
@@ -162,7 +168,26 @@ impl OhMyEyesApp {
                 (Vec::new(), true)
             }
         };
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        let (overlay, displays, overlay_failed) =
+            match crate::linux_wayland::OverlayController::create(
+                commands_tx.clone(),
+                Some(cc.egui_ctx.clone()),
+            ) {
+                Ok((overlay, displays)) => (
+                    Some(overlay),
+                    displays.into_iter().map(DisplayInfo::from).collect(),
+                    false,
+                ),
+                Err(error) => {
+                    append_status(
+                        &mut status,
+                        format!("Could not create Wayland reminder overlay: {error}"),
+                    );
+                    (None, Vec::new(), true)
+                }
+            };
+        #[cfg(not(any(windows, target_os = "linux")))]
         let displays = enumerate_displays(cc);
         #[cfg(windows)]
         let (selected_display, display_id_migrated) =
@@ -202,7 +227,7 @@ impl OhMyEyesApp {
             settings.overlay_duration(),
             settings.reminders_enabled,
         );
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         let ipc_failed = match ipc_server {
             Ok(server) => {
                 server.attach_context(cc.egui_ctx.clone());
@@ -217,7 +242,10 @@ impl OhMyEyesApp {
                 true
             }
         };
+        #[cfg(windows)]
         let mut session_notification_status = None;
+        #[cfg(not(windows))]
+        let session_notification_status = None;
         #[cfg(windows)]
         if let Err(error) =
             crate::windows::start_system_event_monitor(commands_tx.clone(), cc.egui_ctx.clone())
@@ -241,7 +269,9 @@ impl OhMyEyesApp {
         #[cfg(windows)]
         let settings_open =
             !background || ipc_failed || overlay_failed || display_enumeration_failed;
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        let settings_open = !background || ipc_failed || overlay_failed;
+        #[cfg(not(any(windows, target_os = "linux")))]
         let settings_open = !background;
         let mut app = Self {
             started_at,
@@ -259,17 +289,20 @@ impl OhMyEyesApp {
             settings_size_initialized: false,
             settings_save_due_at: None,
             root_visible: !background,
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             root_controller_mode: false,
             quitting: false,
             system_pause_mask: 0,
             session_notification_status,
             status,
             commands_rx,
+            #[cfg(windows)]
             commands_tx,
             #[cfg(windows)]
             tray: None,
             #[cfg(windows)]
+            overlay,
+            #[cfg(target_os = "linux")]
             overlay,
         };
         app.refresh_tray(&cc.egui_ctx);
@@ -277,7 +310,7 @@ impl OhMyEyesApp {
             let action = app.scheduler.show_now(app.now());
             app.apply_scheduler_action(&cc.egui_ctx, action);
         }
-        app
+        Ok(app)
     }
 
     fn now(&self) -> Duration {
@@ -298,7 +331,13 @@ impl OhMyEyesApp {
                 {
                     self.status = Some(format!("Could not hide reminder overlay: {error}"));
                 }
-                #[cfg(not(windows))]
+                #[cfg(target_os = "linux")]
+                if let Some(overlay) = &self.overlay
+                    && let Err(error) = overlay.hide()
+                {
+                    self.status = Some(format!("Could not hide Wayland reminder overlay: {error}"));
+                }
+                #[cfg(not(any(windows, target_os = "linux")))]
                 ctx.send_viewport_cmd_to(overlay_viewport_id(), egui::ViewportCommand::Close);
             }
             SchedulerAction::None => {}
@@ -309,7 +348,7 @@ impl OhMyEyesApp {
     }
 
     fn update_root_visibility(&mut self, ctx: &egui::Context) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let visible = self.settings_open;
             if visible != self.root_visible {
@@ -317,7 +356,7 @@ impl OhMyEyesApp {
                 send_root_command(ctx, egui::ViewportCommand::Visible(visible));
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let overlay_visible = self.scheduler.is_showing();
             if self.settings_open && self.root_controller_mode {
@@ -401,9 +440,23 @@ impl OhMyEyesApp {
         {
             self.status = Some(format!("Could not show reminder overlay: {error}"));
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        if let (Some(overlay), Some(display)) =
+            (&self.overlay, self.displays.get(self.selected_display))
+            && let Err(error) = overlay.show(
+                &display.id,
+                &self.image.frame_or_first(self.animation_frame_index).rgba,
+                self.image.size,
+                self.settings.width_percent,
+                self.settings.opacity_percent,
+                [self.settings.position.x, self.settings.position.y],
+            )
+        {
+            self.status = Some(format!("Could not show Wayland reminder overlay: {error}"));
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         ctx.request_repaint();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         let _ = ctx;
     }
 
@@ -412,7 +465,7 @@ impl OhMyEyesApp {
             return;
         }
         self.animation_frame_index = index;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if !self.settings_open {
             return;
         }
@@ -491,6 +544,23 @@ impl OhMyEyesApp {
                 self.initialize_settings_window(ctx);
                 send_root_command(ctx, egui::ViewportCommand::Focus);
             }
+            AppCommand::RunInBackground => {
+                #[cfg(target_os = "linux")]
+                match crate::linux_daemon::spawn_background_takeover() {
+                    Ok(()) => {
+                        self.quitting = true;
+                        send_root_command(ctx, egui::ViewportCommand::Close);
+                    }
+                    Err(error) => {
+                        self.status = Some(format!("Could not continue in background: {error}"));
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.settings_open = false;
+                    self.update_root_visibility(ctx);
+                }
+            }
             AppCommand::ShowNow => {
                 let action = self.scheduler.show_now(self.now());
                 self.apply_scheduler_action(ctx, action);
@@ -506,6 +576,8 @@ impl OhMyEyesApp {
             }
             AppCommand::DisplayTopologyChanged => {
                 #[cfg(windows)]
+                self.refresh_displays(ctx);
+                #[cfg(target_os = "linux")]
                 self.refresh_displays(ctx);
             }
             AppCommand::SessionNotificationsDelayed => {
@@ -583,6 +655,53 @@ impl OhMyEyesApp {
             append_status(
                 &mut self.status,
                 "Selected display was disconnected; switched to the primary display".to_owned(),
+            );
+        }
+        self.refresh_overlay(ctx);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refresh_displays(&mut self, ctx: &egui::Context) {
+        let selected_id = self
+            .displays
+            .get(self.selected_display)
+            .map(|display| display.id.clone());
+        let Some(overlay) = &self.overlay else {
+            return;
+        };
+        let displays: Vec<DisplayInfo> = match overlay.displays() {
+            Ok(displays) => displays.into_iter().map(DisplayInfo::from).collect(),
+            Err(error) => {
+                append_status(
+                    &mut self.status,
+                    format!("Could not refresh Wayland outputs: {error}"),
+                );
+                return;
+            }
+        };
+        if displays.is_empty() {
+            append_status(
+                &mut self.status,
+                "Wayland compositor reported no outputs".to_owned(),
+            );
+            return;
+        }
+        let selected_display = selected_id
+            .as_ref()
+            .and_then(|id| displays.iter().position(|display| &display.id == id))
+            .unwrap_or(0);
+        let selection_was_removed = selected_id.is_some()
+            && selected_id
+                .as_ref()
+                .is_none_or(|id| displays.iter().all(|display| &display.id != id));
+        self.displays = displays;
+        self.selected_display = selected_display;
+        if selection_was_removed {
+            self.save_settings();
+            append_status(
+                &mut self.status,
+                "Selected output was disconnected; switched to the first available output"
+                    .to_owned(),
             );
         }
         self.refresh_overlay(ctx);
@@ -730,9 +849,18 @@ impl OhMyEyesApp {
             system_changed |= ui
                 .checkbox(&mut self.settings.start_at_login, "Start at login")
                 .changed();
-            system_changed |= ui
-                .checkbox(&mut self.settings.show_tray_icon, "Show tray icon")
-                .changed();
+            #[cfg(windows)]
+            {
+                system_changed |= ui
+                    .checkbox(&mut self.settings.show_tray_icon, "Show tray icon")
+                    .changed();
+            }
+            #[cfg(not(windows))]
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(&mut false, "Show tray icon (Windows only)"),
+            );
+            #[cfg(windows)]
             ui.horizontal(|ui| {
                 ui.label("After sleep or lock");
                 system_changed |= ui
@@ -750,6 +878,8 @@ impl OhMyEyesApp {
                     )
                     .changed();
             });
+            #[cfg(not(windows))]
+            ui.small("Sleep and session-lock integration is not available on Linux yet.");
             if let Some(status) = &self.session_notification_status {
                 ui.small(status);
             }
@@ -833,6 +963,17 @@ impl OhMyEyesApp {
                 self.status = Some(format!("Could not update start at login: {error}"));
             }
         }
+        #[cfg(target_os = "linux")]
+        match std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|path| crate::linux::set_start_at_login(&path, self.settings.start_at_login))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                self.settings.start_at_login = false;
+                self.status = Some(format!("Could not update start at login: {error}"));
+            }
+        }
         self.refresh_tray(ctx);
         self.update_root_visibility(ctx);
         self.save_settings();
@@ -855,6 +996,17 @@ impl eframe::App for OhMyEyesApp {
             append_status(
                 &mut self.status,
                 format!("Could not render reminder overlay: {error}"),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(error) = self
+            .overlay
+            .as_ref()
+            .and_then(crate::linux_wayland::OverlayController::take_error)
+        {
+            append_status(
+                &mut self.status,
+                format!("Could not render Wayland reminder overlay: {error}"),
             );
         }
         let action = self.scheduler.tick(self.now());
@@ -885,8 +1037,21 @@ impl eframe::App for OhMyEyesApp {
             if self.settings_save_due_at.is_some() {
                 self.save_settings();
             }
-            self.settings_open = false;
-            self.update_root_visibility(&ctx);
+            #[cfg(target_os = "linux")]
+            match crate::linux_daemon::spawn_background_takeover() {
+                Ok(()) => {
+                    self.quitting = true;
+                    send_root_command(&ctx, egui::ViewportCommand::Close);
+                }
+                Err(error) => {
+                    self.status = Some(format!("Could not continue in background: {error}"));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.settings_open = false;
+                self.update_root_visibility(&ctx);
+            }
         }
 
         if self.settings_open {
@@ -895,7 +1060,7 @@ impl eframe::App for OhMyEyesApp {
             });
         }
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         if self.scheduler.is_showing() {
             let monitor = self
                 .displays
@@ -983,7 +1148,17 @@ impl From<crate::windows::NativeDisplay> for DisplayInfo {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+impl From<crate::linux_wayland::NativeDisplay> for DisplayInfo {
+    fn from(display: crate::linux_wayland::NativeDisplay) -> Self {
+        Self {
+            id: display.id,
+            label: display.label,
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn enumerate_displays(cc: &CreationContext<'_>) -> Vec<DisplayInfo> {
     let mut displays: Vec<_> = cc
         .winit_window()

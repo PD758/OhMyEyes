@@ -62,17 +62,24 @@ pub struct DecodedImage {
     pub color_image: egui::ColorImage,
     pub aspect_ratio: f32,
     pub size: [u32; 2],
-    frames: Vec<DecodedFrame>,
+    first_frame: DecodedFrame,
+    additional_frames: Vec<DecodedFrame>,
     cycle_duration: Duration,
 }
 
 impl DecodedImage {
     pub fn is_animated(&self) -> bool {
-        self.frames.len() > 1
+        !self.additional_frames.is_empty()
     }
 
     pub fn frame_or_first(&self, index: usize) -> &DecodedFrame {
-        self.frames.get(index).unwrap_or(&self.frames[0])
+        if index == 0 {
+            &self.first_frame
+        } else {
+            self.additional_frames
+                .get(index - 1)
+                .unwrap_or(&self.first_frame)
+        }
     }
 
     pub fn frame_at(&self, elapsed: Duration) -> (usize, Duration) {
@@ -80,14 +87,17 @@ impl DecodedImage {
             return (0, Duration::MAX);
         }
         let mut position = elapsed.as_millis() % self.cycle_duration.as_millis();
-        for (index, frame) in self.frames.iter().enumerate() {
+        for (index, frame) in std::iter::once(&self.first_frame)
+            .chain(self.additional_frames.iter())
+            .enumerate()
+        {
             let duration = frame.duration.as_millis();
             if position < duration {
                 return (index, Duration::from_millis((duration - position) as u64));
             }
             position -= duration;
         }
-        (0, self.frames[0].duration)
+        (0, self.first_frame.duration)
     }
 }
 
@@ -244,26 +254,28 @@ fn decoded_image_from_frames(
     size: [u32; 2],
     frames: Vec<DecodedFrame>,
 ) -> Result<DecodedImage, ImageAssetError> {
-    let first = frames
-        .first()
-        .ok_or_else(|| ImageAssetError::EmptyAnimation)?;
-    let cycle_duration = frames
-        .iter()
+    let mut frames = frames.into_iter();
+    let first_frame = frames.next().ok_or(ImageAssetError::EmptyAnimation)?;
+    let additional_frames: Vec<_> = frames.collect();
+    let cycle_duration = std::iter::once(&first_frame)
+        .chain(additional_frames.iter())
         .fold(Duration::ZERO, |total, frame| total + frame.duration);
     let aspect_ratio = size[0] as f32 / size[1].max(1) as f32;
     Ok(DecodedImage {
         color_image: egui::ColorImage::from_rgba_unmultiplied(
             [size[0] as usize, size[1] as usize],
-            &first.rgba,
+            &first_frame.rgba,
         ),
         aspect_ratio,
         size,
-        frames,
+        first_frame,
+        additional_frames,
         cycle_duration,
     })
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::fs;
 

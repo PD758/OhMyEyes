@@ -36,6 +36,7 @@ pub(crate) fn read_file(path: &Path, limit: usize) -> Result<Vec<u8>, LimitedRea
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::io::Write;
 

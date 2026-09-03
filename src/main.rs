@@ -1,4 +1,5 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+#![cfg_attr(not(windows), forbid(unsafe_code))]
 
 use std::{error::Error, path::PathBuf};
 
@@ -10,23 +11,66 @@ use ohmyeyes::{
 
 fn main() -> Result<(), Box<dyn Error>> {
     init_logging();
-    let background = std::env::args().any(|argument| argument == "--background");
-    let show_now = std::env::args().any(|argument| argument == "--show-now");
+    let arguments: Vec<_> = std::env::args().collect();
+    let show_now = arguments.iter().any(|argument| argument == "--show-now");
+    #[cfg(target_os = "linux")]
+    let takeover = arguments.iter().any(|argument| {
+        argument == ohmyeyes::linux_daemon::BACKGROUND_TAKEOVER_ARGUMENT
+            || argument == ohmyeyes::linux_daemon::FOREGROUND_TAKEOVER_ARGUMENT
+    });
+    let background = arguments.iter().any(|argument| argument == "--background")
+        || cfg!(target_os = "linux")
+            && arguments
+                .iter()
+                .any(|argument| argument == "--background-takeover");
 
     #[cfg(windows)]
     let _instance = {
-        let instance = single_instance::SingleInstance::new("app.ohmyeyes.desktop")?;
+        let instance_name = ohmyeyes::ipc::instance_name()?;
+        let instance = single_instance::SingleInstance::new(&instance_name)?;
         if !instance.is_single() {
-            let command = if show_now {
+            let command = if background {
+                ohmyeyes::AppCommand::RunInBackground
+            } else if show_now {
                 ohmyeyes::AppCommand::ShowNow
             } else {
                 ohmyeyes::AppCommand::OpenSettings
             };
-            ohmyeyes::windows::notify_running_instance(command)?;
+            ohmyeyes::ipc::notify_running_instance(command)?;
             return Ok(());
         }
         instance
     };
+
+    #[cfg(target_os = "linux")]
+    let _instance = {
+        let takeover_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(instance) = ohmyeyes::ipc::try_instance_lock()? {
+                break instance;
+            }
+            if takeover && std::time::Instant::now() < takeover_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
+            let command = if background {
+                ohmyeyes::AppCommand::RunInBackground
+            } else if show_now {
+                ohmyeyes::AppCommand::ShowNow
+            } else {
+                ohmyeyes::AppCommand::OpenSettings
+            };
+            ohmyeyes::ipc::notify_running_instance(command)?;
+            return Ok(());
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    if background {
+        return ohmyeyes::linux_daemon::run(show_now)
+            .map_err(std::io::Error::other)
+            .map_err(Into::into);
+    }
 
     let startup = AppStartup::initialize();
 
@@ -64,7 +108,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Box::new(move |cc| {
             Ok(Box::new(OhMyEyesApp::new(
                 cc, background, show_now, startup,
-            )))
+            )?))
         }),
     )?;
     Ok(())
