@@ -9,6 +9,38 @@ permissions:
   contents: write
 
 jobs:
+  linux-wayland:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+      - name: Install Wayland build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev
+      - name: Verify release tag
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Test
+        run: cargo test --all-targets --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Build portable archive
+        run: ./scripts/package-linux.sh --skip-build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: OhMyEyes-linux-x86_64
+          path: dist/**
+      - uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
+        with:
+          files: dist/**
+          generate_release_notes: true
+
   windows:
     runs-on: windows-latest
     steps:
