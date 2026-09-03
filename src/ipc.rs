@@ -45,6 +45,7 @@ pub fn instance_name() -> io::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 pub struct InstanceLock {
     _file: std::fs::File,
 }
@@ -234,6 +235,18 @@ mod tests {
                 expected
             );
         }
+
+        let name = endpoint
+            .to_ns_name::<GenericNamespaced>()
+            .expect("test IPC name should convert");
+        let mut stream = Stream::connect(name).expect("raw IPC connection should open");
+        stream
+            .write_all(b"unknown\n")
+            .expect("unknown command should be written");
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -260,6 +273,34 @@ mod tests {
             try_instance_lock_at(&path)
                 .expect("lock should be reusable after drop")
                 .is_some()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_directory_validation_rejects_files_and_missing_paths() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        validate_runtime_directory(directory.path()).expect("owned directory should be valid");
+
+        let file = directory.path().join("regular-file");
+        std::fs::write(&file, b"not a directory").expect("test file should be written");
+        assert_eq!(
+            validate_runtime_directory(&file)
+                .expect_err("regular file should be rejected")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            validate_runtime_directory(&directory.path().join("missing"))
+                .expect_err("missing path should be rejected")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            try_instance_lock_at(&directory.path().join("missing/lock"))
+                .expect_err("lock in a missing directory should fail")
+                .kind(),
+            io::ErrorKind::NotFound
         );
     }
 }

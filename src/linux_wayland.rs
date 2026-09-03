@@ -637,38 +637,61 @@ struct OverlayLayout {
 }
 
 fn output_id(info: &OutputInfo) -> String {
-    info.name
-        .clone()
-        .unwrap_or_else(|| format!("wayland-output-{}", info.id))
+    output_id_from(info.id, info.name.as_deref())
 }
 
 fn output_label(info: &OutputInfo) -> String {
-    let name = info.name.as_deref().unwrap_or("Wayland output");
-    let description = info
-        .description
-        .as_deref()
+    output_label_from(
+        info.name.as_deref(),
+        info.description.as_deref(),
+        &info.model,
+        logical_output_size(info),
+    )
+}
+
+fn output_id_from(id: u32, name: Option<&str>) -> String {
+    name.map_or_else(|| format!("wayland-output-{id}"), str::to_owned)
+}
+
+fn output_label_from(
+    name: Option<&str>,
+    description: Option<&str>,
+    model: &str,
+    logical_size: Option<(u32, u32)>,
+) -> String {
+    let name = name.unwrap_or("Wayland output");
+    let description = description
         .filter(|description| *description != name)
-        .unwrap_or(info.model.as_str());
-    logical_output_size(info).map_or_else(
+        .unwrap_or(model);
+    logical_size.map_or_else(
         || format!("{name} — {description}"),
         |(width, height)| format!("{name} — {description} ({width} x {height})"),
     )
 }
 
 fn logical_output_size(info: &OutputInfo) -> Option<(u32, u32)> {
-    info.logical_size
+    let current_mode = info
+        .modes
+        .iter()
+        .find(|mode| mode.current)
+        .map(|mode| mode.dimensions);
+    logical_output_size_from(info.logical_size, info.scale_factor, current_mode)
+}
+
+fn logical_output_size_from(
+    logical_size: Option<(i32, i32)>,
+    scale_factor: i32,
+    current_mode: Option<(i32, i32)>,
+) -> Option<(u32, u32)> {
+    logical_size
         .and_then(|(width, height)| Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?)))
         .or_else(|| {
-            let scale = info.scale_factor.max(1);
-            info.modes
-                .iter()
-                .find(|mode| mode.current)
-                .and_then(|mode| {
-                    Some((
-                        u32::try_from(mode.dimensions.0 / scale).ok()?,
-                        u32::try_from(mode.dimensions.1 / scale).ok()?,
-                    ))
-                })
+            let scale = scale_factor.max(1);
+            let (width, height) = current_mode?;
+            Some((
+                u32::try_from(width / scale).ok()?,
+                u32::try_from(height / scale).ok()?,
+            ))
         })
         .filter(|(width, height)| *width > 0 && *height > 0)
 }
@@ -783,5 +806,209 @@ mod tests {
             .expect("frame should render");
 
         assert_eq!(canvas, [50, 12, 25, 64]);
+    }
+
+    #[test]
+    fn controller_commands_round_trip_without_a_compositor() {
+        let (sender, receiver) = channel::channel();
+        let controller = OverlayController {
+            sender,
+            last_error: Arc::new(Mutex::new(None)),
+        };
+
+        controller
+            .show("DP-1", &[1, 2, 3, 4], [1, 1], 25, 55, [0.25, 0.75])
+            .expect("show command should be queued");
+        match receiver.recv().expect("show command should arrive") {
+            OverlayCommand::Show {
+                display_id,
+                rgba,
+                image_size,
+                width_percent,
+                opacity_percent,
+                position,
+            } => {
+                assert_eq!(display_id, "DP-1");
+                assert_eq!(rgba, [1, 2, 3, 4]);
+                assert_eq!(image_size, [1, 1]);
+                assert_eq!(width_percent, 25);
+                assert_eq!(opacity_percent, 55);
+                assert_eq!(position, [0.25, 0.75]);
+            }
+            _ => panic!("unexpected overlay command"),
+        }
+
+        controller.hide().expect("hide command should be queued");
+        assert!(matches!(
+            receiver.recv().expect("hide command should arrive"),
+            OverlayCommand::Hide
+        ));
+
+        std::thread::scope(|scope| {
+            let query = scope.spawn(|| controller.displays());
+            let OverlayCommand::Displays(reply) =
+                receiver.recv().expect("display query should arrive")
+            else {
+                panic!("unexpected overlay command");
+            };
+            reply
+                .send(vec![NativeDisplay {
+                    id: "DP-1".to_owned(),
+                    label: "Primary".to_owned(),
+                }])
+                .expect("display reply should be accepted");
+            let displays = query
+                .join()
+                .expect("display query thread should finish")
+                .expect("display query should succeed");
+            assert_eq!(displays.len(), 1);
+            assert_eq!(displays[0].id, "DP-1");
+            assert_eq!(displays[0].label, "Primary");
+        });
+
+        set_last_error(&controller.last_error, "render failed".to_owned());
+        assert_eq!(controller.take_error().as_deref(), Some("render failed"));
+        assert_eq!(controller.take_error(), None);
+
+        drop(controller);
+        assert!(matches!(
+            receiver.recv().expect("shutdown command should arrive"),
+            OverlayCommand::Shutdown
+        ));
+    }
+
+    #[test]
+    fn controller_reports_a_closed_worker_channel() {
+        let (sender, receiver) = channel::channel();
+        drop(receiver);
+        let controller = OverlayController {
+            sender,
+            last_error: Arc::new(Mutex::new(None)),
+        };
+
+        assert_eq!(
+            controller
+                .show("DP-1", &[0; 4], [1, 1], 25, 55, [0.5, 0.5])
+                .expect_err("closed worker should reject show"),
+            "Wayland overlay worker is unavailable"
+        );
+        assert_eq!(
+            controller
+                .hide()
+                .expect_err("closed worker should reject hide"),
+            "Wayland overlay worker is unavailable"
+        );
+        assert_eq!(
+            controller
+                .displays()
+                .expect_err("closed worker should reject display query"),
+            "Wayland overlay worker is unavailable"
+        );
+    }
+
+    #[test]
+    fn overlay_layout_rejects_empty_dimensions_and_scales_landscape_images() {
+        for (monitor, image) in [
+            ((0, 1_080), [1, 1]),
+            ((1_920, 0), [1, 1]),
+            ((1_920, 1_080), [0, 1]),
+            ((1_920, 1_080), [1, 0]),
+        ] {
+            assert_eq!(
+                overlay_layout(monitor, image, 25, [0.5, 0.5])
+                    .expect_err("empty dimensions should fail"),
+                "overlay or image dimensions are empty"
+            );
+        }
+
+        let layout = overlay_layout((1_920, 1_080), [16, 9], 50, [0.5, 0.5])
+            .expect("landscape layout should fit");
+        assert_eq!(layout.size, (960, 540));
+        assert_eq!(layout.margin, (480, 270));
+    }
+
+    #[test]
+    fn overlay_buffer_size_is_checked() {
+        assert_eq!(
+            overlay_buffer_len((100, 50), 2).expect("buffer should fit"),
+            80_000
+        );
+        assert_eq!(
+            overlay_buffer_len((1, 1), -1).expect_err("negative scale should fail"),
+            "invalid Wayland scale"
+        );
+        assert_eq!(
+            overlay_buffer_len((8_192, 8_192), 1).expect("limit should be accepted"),
+            MAX_OVERLAY_BYTES as usize
+        );
+        assert_eq!(
+            overlay_buffer_len((8_193, 8_192), 1).expect_err("oversized buffer should fail"),
+            "overlay pixel buffer exceeds 256 MiB"
+        );
+        assert_eq!(
+            overlay_buffer_len((u32::MAX, u32::MAX), i32::MAX)
+                .expect_err("overflowing buffer should fail"),
+            "overlay pixel buffer is too large"
+        );
+    }
+
+    #[test]
+    fn render_frame_rejects_invalid_source_and_small_canvas() {
+        assert_eq!(
+            render_frame(&mut [0; 4], 1, 1, &[0; 3], [1, 1], 100)
+                .expect_err("invalid RGBA source should fail"),
+            "decoded image buffer has invalid dimensions"
+        );
+        assert_eq!(
+            render_frame(&mut [0; 3], 1, 1, &[10, 20, 30, 255], [1, 1], 100)
+                .expect_err("small canvas should fail"),
+            "Wayland shared-memory buffer is smaller than expected"
+        );
+
+        let mut canvas = [0; 8];
+        render_frame(&mut canvas, 2, 1, &[10, 20, 30, 255], [1, 1], 100)
+            .expect("frame should resize");
+        assert_eq!(canvas, [30, 20, 10, 255, 30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn output_identity_and_labels_have_stable_fallbacks() {
+        assert_eq!(output_id_from(7, Some("DP-1")), "DP-1");
+        assert_eq!(output_id_from(7, None), "wayland-output-7");
+        assert_eq!(
+            output_label_from(
+                Some("DP-1"),
+                Some("Dell Display"),
+                "Dell U2720Q",
+                Some((2_560, 1_440))
+            ),
+            "DP-1 — Dell Display (2560 x 1440)"
+        );
+        assert_eq!(
+            output_label_from(Some("DP-1"), Some("DP-1"), "Dell U2720Q", None),
+            "DP-1 — Dell U2720Q"
+        );
+        assert_eq!(
+            output_label_from(None, None, "Virtual", None),
+            "Wayland output — Virtual"
+        );
+    }
+
+    #[test]
+    fn logical_output_size_prefers_logical_geometry_and_falls_back_to_mode() {
+        assert_eq!(
+            logical_output_size_from(Some((1_280, 720)), 2, Some((3_840, 2_160))),
+            Some((1_280, 720))
+        );
+        assert_eq!(
+            logical_output_size_from(None, 2, Some((3_840, 2_160))),
+            Some((1_920, 1_080))
+        );
+        assert_eq!(
+            logical_output_size_from(Some((-1, 720)), 0, Some((1_920, 1_080))),
+            Some((1_920, 1_080))
+        );
+        assert_eq!(logical_output_size_from(None, 1, Some((0, 1_080))), None);
+        assert_eq!(logical_output_size_from(None, 1, None), None);
     }
 }

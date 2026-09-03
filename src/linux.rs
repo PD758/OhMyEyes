@@ -91,5 +91,29 @@ mod tests {
         set_start_at_login_in(Path::new("/opt/ohmyeyes"), false, &autostart)
             .expect("autostart should be disabled");
         assert!(!desktop_file.exists());
+
+        set_start_at_login_in(Path::new("/opt/ohmyeyes"), false, &autostart)
+            .expect("disabling missing autostart should be idempotent");
+    }
+
+    #[test]
+    fn invalid_executable_and_autostart_targets_are_reported() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+        let invalid_path = Path::new(OsStr::from_bytes(b"/tmp/ohmyeyes-\xff"));
+        assert_eq!(
+            desktop_exec_argument(invalid_path).expect_err("non-UTF-8 path should fail"),
+            "the executable path is not valid UTF-8"
+        );
+
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let blocker = directory.path().join("not-a-directory");
+        fs::write(&blocker, b"file").expect("blocker should be written");
+        assert!(set_start_at_login_in(Path::new("/opt/ohmyeyes"), true, &blocker).is_err());
+
+        let autostart = directory.path().join("autostart");
+        let desktop_file = autostart.join(AUTOSTART_FILE_NAME);
+        fs::create_dir_all(&desktop_file).expect("directory target should be created");
+        assert!(set_start_at_login_in(Path::new("/opt/ohmyeyes"), false, &autostart).is_err());
     }
 }

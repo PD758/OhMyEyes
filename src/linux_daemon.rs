@@ -18,6 +18,66 @@ pub const BACKGROUND_TAKEOVER_ARGUMENT: &str = "--background-takeover";
 pub const FOREGROUND_TAKEOVER_ARGUMENT: &str = "--foreground-takeover";
 const ERROR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+fn next_wait(schedule: Option<Duration>, animation: Option<Duration>) -> Duration {
+    match (schedule, animation) {
+        (Some(schedule), Some(animation)) => schedule.min(animation),
+        (Some(schedule), None) => schedule,
+        (None, Some(animation)) => animation,
+        (None, None) => ERROR_POLL_INTERVAL,
+    }
+    .min(ERROR_POLL_INTERVAL)
+}
+
+trait OverlayBackend {
+    #[allow(clippy::too_many_arguments)]
+    fn show(
+        &self,
+        display_id: &str,
+        rgba: &[u8],
+        image_size: [u32; 2],
+        width_percent: u8,
+        opacity_percent: u8,
+        position: [f32; 2],
+    ) -> Result<(), String>;
+    fn hide(&self) -> Result<(), String>;
+    fn displays(&self) -> Result<Vec<NativeDisplay>, String>;
+    fn take_error(&self) -> Option<String>;
+}
+
+impl OverlayBackend for OverlayController {
+    fn show(
+        &self,
+        display_id: &str,
+        rgba: &[u8],
+        image_size: [u32; 2],
+        width_percent: u8,
+        opacity_percent: u8,
+        position: [f32; 2],
+    ) -> Result<(), String> {
+        OverlayController::show(
+            self,
+            display_id,
+            rgba,
+            image_size,
+            width_percent,
+            opacity_percent,
+            position,
+        )
+    }
+
+    fn hide(&self) -> Result<(), String> {
+        OverlayController::hide(self)
+    }
+
+    fn displays(&self) -> Result<Vec<NativeDisplay>, String> {
+        OverlayController::displays(self)
+    }
+
+    fn take_error(&self) -> Option<String> {
+        OverlayController::take_error(self)
+    }
+}
+
 pub fn run(show_now: bool) -> Result<(), String> {
     let (commands_tx, commands_rx) = mpsc::channel();
     let _ipc_server =
@@ -78,7 +138,7 @@ fn spawn_takeover(argument: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-struct Daemon {
+struct Daemon<O: OverlayBackend = OverlayController> {
     started_at: Instant,
     scheduler: ReminderScheduler,
     settings: Settings,
@@ -88,11 +148,11 @@ struct Daemon {
     selected_display: usize,
     animation_started_at: Duration,
     animation_frame_index: usize,
-    overlay: OverlayController,
+    overlay: O,
     commands_rx: Receiver<AppCommand>,
 }
 
-impl Daemon {
+impl<O: OverlayBackend> Daemon<O> {
     fn now(&self) -> Duration {
         self.started_at.elapsed()
     }
@@ -105,13 +165,7 @@ impl Daemon {
             if let Some(error) = self.overlay.take_error() {
                 tracing::warn!(%error, "Wayland overlay command failed");
             }
-            let wait = match (self.scheduler.next_wake_in(self.now()), next_animation) {
-                (Some(schedule), Some(animation)) => schedule.min(animation),
-                (Some(schedule), None) => schedule,
-                (None, Some(animation)) => animation,
-                (None, None) => ERROR_POLL_INTERVAL,
-            }
-            .min(ERROR_POLL_INTERVAL);
+            let wait = next_wait(self.scheduler.next_wake_in(self.now()), next_animation);
             match self.commands_rx.recv_timeout(wait) {
                 Ok(command) if self.process_command(command)? => return Ok(()),
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -266,5 +320,352 @@ fn load_configured_image(
                 .map_err(|error| error.to_string())?;
             load_default().map_err(|error| error.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        sync::mpsc::Sender,
+    };
+
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct ShowCall {
+        display_id: String,
+        image_size: [u32; 2],
+        width_percent: u8,
+        opacity_percent: u8,
+        position: [f32; 2],
+    }
+
+    struct FakeOverlay {
+        show_calls: RefCell<Vec<ShowCall>>,
+        hide_count: Cell<usize>,
+        displays: RefCell<Result<Vec<NativeDisplay>, String>>,
+        error: RefCell<Option<String>>,
+    }
+
+    impl FakeOverlay {
+        fn new(displays: Vec<NativeDisplay>) -> Self {
+            Self {
+                show_calls: RefCell::new(Vec::new()),
+                hide_count: Cell::new(0),
+                displays: RefCell::new(Ok(displays)),
+                error: RefCell::new(None),
+            }
+        }
+    }
+
+    impl OverlayBackend for FakeOverlay {
+        fn show(
+            &self,
+            display_id: &str,
+            _rgba: &[u8],
+            image_size: [u32; 2],
+            width_percent: u8,
+            opacity_percent: u8,
+            position: [f32; 2],
+        ) -> Result<(), String> {
+            self.show_calls.borrow_mut().push(ShowCall {
+                display_id: display_id.to_owned(),
+                image_size,
+                width_percent,
+                opacity_percent,
+                position,
+            });
+            Ok(())
+        }
+
+        fn hide(&self) -> Result<(), String> {
+            self.hide_count.set(self.hide_count.get() + 1);
+            Ok(())
+        }
+
+        fn displays(&self) -> Result<Vec<NativeDisplay>, String> {
+            self.displays.borrow().clone()
+        }
+
+        fn take_error(&self) -> Option<String> {
+            self.error.borrow_mut().take()
+        }
+    }
+
+    fn display(id: &str) -> NativeDisplay {
+        NativeDisplay {
+            id: id.to_owned(),
+            label: id.to_owned(),
+        }
+    }
+
+    fn daemon(
+        settings: Settings,
+        displays: Vec<NativeDisplay>,
+        config_store: ConfigStore,
+        commands_rx: Receiver<AppCommand>,
+    ) -> Daemon<FakeOverlay> {
+        let scheduler = ReminderScheduler::new(
+            Duration::ZERO,
+            settings.interval(),
+            settings.overlay_duration(),
+            settings.reminders_enabled,
+        );
+        Daemon {
+            started_at: Instant::now(),
+            scheduler,
+            settings,
+            config_store,
+            image: load_default().expect("default image should load"),
+            selected_display: 0,
+            overlay: FakeOverlay::new(displays.clone()),
+            displays,
+            animation_started_at: Duration::ZERO,
+            animation_frame_index: 0,
+            commands_rx,
+        }
+    }
+
+    fn command_channel() -> (Sender<AppCommand>, Receiver<AppCommand>) {
+        mpsc::channel()
+    }
+
+    #[test]
+    fn display_selection_uses_configured_id_or_first_output() {
+        let displays = vec![display("left"), display("right")];
+        let configured = Settings {
+            display_id: Some("right".to_owned()),
+            ..Settings::default()
+        };
+        let missing = Settings {
+            display_id: Some("missing".to_owned()),
+            ..Settings::default()
+        };
+
+        assert_eq!(selected_display(&configured, &displays), 1);
+        assert_eq!(selected_display(&missing, &displays), 0);
+        assert_eq!(selected_display(&configured, &[]), 0);
+    }
+
+    #[test]
+    fn configured_image_falls_back_and_persists_the_repair() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let mut settings = Settings {
+            image_path: Some(PathBuf::from("missing.png")),
+            ..Settings::default()
+        };
+
+        let image = load_configured_image(&mut settings, &store, directory.path())
+            .expect("default image should be used");
+
+        assert_eq!(
+            image.size,
+            load_default().expect("default image should load").size
+        );
+        assert_eq!(settings.image_path, None);
+        assert_eq!(
+            store
+                .load()
+                .expect("repaired settings should load")
+                .settings
+                .image_path,
+            None
+        );
+    }
+
+    #[test]
+    fn configured_image_loads_default_and_valid_file() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let mut defaults = Settings::default();
+        let default_image = load_configured_image(&mut defaults, &store, directory.path())
+            .expect("default image should load");
+        let image_path = directory.path().join("eye.png");
+        std::fs::write(&image_path, crate::image_asset::DEFAULT_EYE_BYTES)
+            .expect("test image should be written");
+        let mut configured = Settings {
+            image_path: Some(image_path),
+            ..Settings::default()
+        };
+        let configured_image = load_configured_image(&mut configured, &store, directory.path())
+            .expect("configured image should load");
+
+        assert_eq!(configured_image.size, default_image.size);
+    }
+
+    #[test]
+    fn daemon_processes_overlay_and_scheduler_commands() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let (_sender, receiver) = command_channel();
+        let mut daemon = daemon(
+            Settings::default(),
+            vec![display("primary")],
+            store,
+            receiver,
+        );
+
+        assert!(
+            !daemon
+                .process_command(AppCommand::RunInBackground)
+                .expect("background command should succeed")
+        );
+        assert!(
+            !daemon
+                .process_command(AppCommand::SessionNotificationsReady)
+                .expect("irrelevant native command should be ignored")
+        );
+        assert!(
+            !daemon
+                .process_command(AppCommand::ShowNow)
+                .expect("show command should succeed")
+        );
+        assert_eq!(daemon.overlay.show_calls.borrow().len(), 1);
+        assert!(
+            !daemon
+                .process_command(AppCommand::ToggleReminders)
+                .expect("toggle command should succeed")
+        );
+        assert!(!daemon.settings.reminders_enabled);
+        assert_eq!(daemon.overlay.hide_count.get(), 1);
+        *daemon.overlay.displays.borrow_mut() = Err("enumeration failed".to_owned());
+        assert!(
+            !daemon
+                .process_command(AppCommand::DisplayTopologyChanged)
+                .expect("display errors should be contained")
+        );
+        assert!(
+            daemon
+                .process_command(AppCommand::Quit)
+                .expect("quit command should succeed")
+        );
+    }
+
+    #[test]
+    fn display_refresh_preserves_or_repairs_selection() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let settings = Settings {
+            display_id: Some("right".to_owned()),
+            ..Settings::default()
+        };
+        let (_sender, receiver) = command_channel();
+        let mut daemon = daemon(
+            settings,
+            vec![display("left"), display("right")],
+            store,
+            receiver,
+        );
+        daemon.selected_display = 1;
+        daemon
+            .process_command(AppCommand::ShowNow)
+            .expect("overlay should be shown");
+        *daemon.overlay.displays.borrow_mut() = Ok(vec![display("right"), display("left")]);
+        daemon.refresh_displays().expect("outputs should refresh");
+        assert_eq!(daemon.selected_display, 0);
+        assert_eq!(daemon.settings.display_id.as_deref(), Some("right"));
+        assert_eq!(daemon.overlay.show_calls.borrow().len(), 2);
+
+        *daemon.overlay.displays.borrow_mut() = Ok(vec![display("replacement")]);
+        daemon
+            .refresh_displays()
+            .expect("missing output should be repaired");
+        assert_eq!(daemon.settings.display_id.as_deref(), Some("replacement"));
+
+        *daemon.overlay.displays.borrow_mut() = Ok(Vec::new());
+        assert_eq!(
+            daemon
+                .refresh_displays()
+                .expect_err("empty outputs should fail"),
+            "Wayland compositor reported no outputs"
+        );
+    }
+
+    #[test]
+    fn event_loop_handles_pending_error_and_quit() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let (sender, receiver) = command_channel();
+        sender
+            .send(AppCommand::Quit)
+            .expect("quit should be queued");
+        let mut daemon = daemon(
+            Settings::default(),
+            vec![display("primary")],
+            store,
+            receiver,
+        );
+        *daemon.overlay.error.borrow_mut() = Some("test error".to_owned());
+
+        daemon
+            .event_loop()
+            .expect("queued quit should stop the loop");
+        assert_eq!(
+            daemon.update_animation().expect("static image is valid"),
+            None
+        );
+        assert!(executable_directory().is_absolute());
+    }
+
+    #[test]
+    fn event_loop_reports_disconnected_command_channel() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let (sender, receiver) = command_channel();
+        drop(sender);
+        let settings = Settings {
+            reminders_enabled: false,
+            ..Settings::default()
+        };
+        let mut daemon = daemon(settings, vec![display("primary")], store, receiver);
+
+        assert_eq!(
+            daemon
+                .event_loop()
+                .expect_err("disconnected channel should stop the loop"),
+            "daemon command channel disconnected"
+        );
+    }
+
+    #[test]
+    fn daemon_wait_uses_the_earliest_bounded_deadline() {
+        assert_eq!(
+            next_wait(
+                Some(Duration::from_millis(800)),
+                Some(Duration::from_millis(20))
+            ),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            next_wait(Some(Duration::from_millis(30)), None),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            next_wait(None, Some(Duration::from_millis(40))),
+            Duration::from_millis(40)
+        );
+        assert_eq!(next_wait(None, None), ERROR_POLL_INTERVAL);
+        assert_eq!(
+            next_wait(Some(Duration::from_secs(20)), None),
+            ERROR_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn showing_without_a_display_is_reported() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let (_sender, receiver) = command_channel();
+        let mut daemon = daemon(Settings::default(), Vec::new(), store, receiver);
+
+        assert_eq!(
+            daemon
+                .process_command(AppCommand::ShowNow)
+                .expect_err("showing without outputs should fail"),
+            "Wayland compositor reported no usable output"
+        );
     }
 }
