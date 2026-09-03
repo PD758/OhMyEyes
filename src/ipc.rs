@@ -17,10 +17,13 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const IPC_BIND_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn notify_running_instance(command: AppCommand) -> io::Result<()> {
+    notify_endpoint(&platform_scoped_name(IPC_NAME)?, command)
+}
+
+fn notify_endpoint(endpoint: &str, command: AppCommand) -> io::Result<()> {
     let message = encode_command(command);
     let deadline = Instant::now() + IPC_TIMEOUT;
     loop {
-        let endpoint = platform_scoped_name(IPC_NAME)?;
         let name = endpoint.to_ns_name::<GenericNamespaced>()?;
         match Stream::connect(name) {
             Ok(mut stream) => return stream.write_all(message),
@@ -83,9 +86,13 @@ impl IpcServer {
 
 pub fn start_ipc_server(sender: Sender<AppCommand>) -> io::Result<IpcServer> {
     let endpoint = platform_scoped_name(IPC_NAME)?;
+    start_ipc_server_at(&endpoint, sender)
+}
+
+fn start_ipc_server_at(endpoint: &str, sender: Sender<AppCommand>) -> io::Result<IpcServer> {
     let deadline = Instant::now() + IPC_BIND_TIMEOUT;
     let listener = loop {
-        let name = endpoint.clone().to_ns_name::<GenericNamespaced>()?;
+        let name = endpoint.to_ns_name::<GenericNamespaced>()?;
         match ListenerOptions::new().name(name).create_sync() {
             Ok(listener) => break listener,
             Err(error) if error.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
@@ -204,6 +211,29 @@ mod tests {
             assert_eq!(decode_command(encoded), Some(command));
         }
         assert_eq!(decode_command("unknown"), None);
+    }
+
+    #[test]
+    fn ipc_server_delivers_commands_and_accepts_context() {
+        let endpoint = platform_scoped_name(&format!("{IPC_NAME}.test-{}", std::process::id()))
+            .expect("test IPC name should resolve");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let server = start_ipc_server_at(&endpoint, sender).expect("IPC server should start");
+        server.attach_context(egui::Context::default());
+
+        for expected in [
+            AppCommand::OpenSettings,
+            AppCommand::RunInBackground,
+            AppCommand::ShowNow,
+        ] {
+            notify_endpoint(&endpoint, expected).expect("IPC command should be sent");
+            assert_eq!(
+                receiver
+                    .recv_timeout(IPC_TIMEOUT)
+                    .expect("IPC command should be received"),
+                expected
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
