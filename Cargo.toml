@@ -27,7 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(windows)'.dependencies]
 auto-launch = "0.6.0"
 single-instance = "0.3.3"
-tray-icon = "0.24.2"
+tray-icon = "0.25.1"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Devices_Display",
