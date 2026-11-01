@@ -32,7 +32,7 @@ jobs:
         run: cargo build --release --locked
       - name: Build portable archive
         run: ./scripts/package-linux.sh --skip-build
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: OhMyEyes-linux-x86_64
           path: dist/**
@@ -71,7 +71,7 @@ jobs:
       - name: Write checksums
         shell: pwsh
         run: .\scripts\write-checksums.ps1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: OhMyEyes-windows-x64
           path: dist/**
